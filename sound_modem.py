@@ -11,7 +11,7 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image
 
 # ============================================================================
-# MODEM CONFIGURATION & CONSTANTS (16x16 Grid)
+# MODEM CONFIGURATION & CONSTANTS
 # ============================================================================
 SAMPLE_RATE = 44100
 SYMBOL_DURATION = 0.100  # 100 ms total per symbol
@@ -19,6 +19,11 @@ TONE_DURATION = 0.080    # 80 ms tone + 20 ms guard silence
 SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
 WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)  # 60ms analysis window
 STEP_SAMPLES = int(SAMPLE_RATE * 0.010)    # 10ms step during sync search
+
+# Payload Type Identifiers
+TYPE_TEXT = 0x01
+TYPE_IMAGE = 0x02
+TYPE_FILE = 0x03
 
 # 16 Data Frequencies: 8000 Hz to 11750 Hz (250 Hz spacing)
 DATA_FREQS = np.array([8000 + i * 250 for i in range(16)])
@@ -67,16 +72,20 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
         wave = np.pad(wave, (0, guard_samples), mode='constant')
     return wave
 
-def build_packet(payload):
-    if len(payload) > 65535:
+def build_packet(data_payload, payload_type):
+    # Payload format: [Type ID (1B)] + [Actual Data]
+    full_payload = bytes([payload_type]) + data_payload
+    if len(full_payload) > 65535:
         raise ValueError("Payload too large for 2-byte length header.")
-    crc = zlib.crc32(payload) & 0xFFFFFFFF
-    packet = struct.pack('>H', len(payload)) + payload + struct.pack('>I', crc)
+    
+    crc = zlib.crc32(full_payload) & 0xFFFFFFFF
+    # Packet structure: [Length (2B)] + [Payload] + [CRC32 (4B)]
+    packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
     return packet
 
-def transmit_payload(payload):
+def transmit_payload(data_payload, payload_type):
     try:
-        packet = build_packet(payload)
+        packet = build_packet(data_payload, payload_type)
         bitstring = "".join(f"{byte:08b}" for byte in packet)
         
         waves = []
@@ -148,6 +157,8 @@ class ReceiverThread(threading.Thread):
         samples_until_next_read = 0
         nibbles = []
         expected_nibbles = None
+        payload_len = 0
+        is_image_packet = False
         expected_sync = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
         sync_armed = False
         best_sync_snr = 0.0
@@ -181,6 +192,8 @@ class ReceiverThread(threading.Thread):
                                 state = "RECEIVE_DATA"
                                 nibbles = []
                                 expected_nibbles = None
+                                payload_len = 0
+                                is_image_packet = False
                                 sync_armed = False
                                 best_sync_snr = 0.0
                                 samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
@@ -189,6 +202,8 @@ class ReceiverThread(threading.Thread):
                             state = "RECEIVE_DATA"
                             nibbles = []
                             expected_nibbles = None
+                            payload_len = 0
+                            is_image_packet = False
                             sync_armed = False
                             best_sync_snr = 0.0
                             samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
@@ -203,28 +218,43 @@ class ReceiverThread(threading.Thread):
                             nibbles.append(best_data_idx)
                             current_nibble_count = len(nibbles)
 
+                            # 1. Header decoded at 4 nibbles (2-byte length)
                             if current_nibble_count == 4:
                                 length_bytes = decode_nibbles_to_bytes(nibbles[:4])
                                 payload_len = struct.unpack('>H', length_bytes)[0]
                                 expected_nibbles = (2 + payload_len + 4) * 2
-                                self.callback_log(f"  Header decoded: expecting {payload_len} bytes...\n")
+                                self.callback_log(f"  Header decoded: expecting {payload_len} bytes payload...\n")
 
-                            elif current_nibble_count > 4 and expected_nibbles and current_nibble_count <= 4 + 256:
-                                pixel_idx = current_nibble_count - 5
+                            # 2. Type ID decoded at 6 nibbles (next byte after length)
+                            elif current_nibble_count == 6:
+                                type_bytes = decode_nibbles_to_bytes(nibbles[4:6])
+                                payload_type = type_bytes[0]
+                                if payload_type == TYPE_IMAGE:
+                                    is_image_packet = True
+                                    self.callback_log("  Detected 16x16 Image stream. Rendering live...\n")
+                                elif payload_type == TYPE_TEXT:
+                                    self.callback_log("  Detected Text Message stream...\n")
+                                else:
+                                    self.callback_log("  Detected Binary File stream...\n")
+
+                            # 3. Live Pixel Rendering if it's explicitly marked as an image stream
+                            elif current_nibble_count > 6 and is_image_packet:
+                                pixel_idx = current_nibble_count - 7  # 0-indexed pixel position after type byte
                                 if pixel_idx < 256:
                                     r = pixel_idx // 16
                                     c = pixel_idx % 16
                                     self.callback_pixel_received(r, c, best_data_idx)
 
+                            # 4. Packet completion check
                             if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
                                 raw_bytes = decode_nibbles_to_bytes(nibbles)
-                                payload = raw_bytes[2:-4]
+                                full_payload = raw_bytes[2:-4]
                                 received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
-                                calculated_crc = zlib.crc32(payload) & 0xFFFFFFFF
+                                calculated_crc = zlib.crc32(full_payload) & 0xFFFFFFFF
                                 
                                 if received_crc == calculated_crc:
-                                    self.callback_log(f"[SUCCESS] CRC Valid! Received {len(payload)} bytes.\n")
-                                    self.callback_packet_received(payload)
+                                    self.callback_log(f"[SUCCESS] CRC Valid! Received packet successfully.\n")
+                                    self.callback_packet_received(full_payload)
                                 else:
                                     self.callback_log(f"[ERROR] CRC Mismatch! (Got {received_crc:#x}, expected {calculated_crc:#x})\n")
                                     
@@ -455,8 +485,6 @@ class SendPage(tk.Frame):
         tk.Button(tools_frame, text="Fill Canvas with Selected", font=("Helvetica", 10, "bold"), highlightbackground="#181825", width=22, pady=5, cursor="hand2", command=self.fill_canvas).pack(pady=4)
         tk.Button(tools_frame, text="Clear Canvas (Black)", font=("Helvetica", 10, "bold"), highlightbackground="#181825", width=22, pady=5, cursor="hand2", command=lambda: self.fill_canvas(0)).pack(pady=4)
         tk.Button(tools_frame, text="Load Test Pattern", font=("Helvetica", 10, "bold"), highlightbackground="#181825", width=22, pady=5, cursor="hand2", command=self.load_test_pattern).pack(pady=4)
-        
-        # --- NEW: Save Image Button ---
         tk.Button(
             tools_frame, text="💾 Save Drawn Image (.png)", font=("Helvetica", 10, "bold"),
             bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=22, pady=6, cursor="hand2",
@@ -506,7 +534,6 @@ class SendPage(tk.Frame):
                     color_idx = self.pixel_data[r][c]
                     rgb = hex_to_rgb(PALETTE[color_idx])
                     img.putpixel((c, r), rgb)
-            # Scale up 16x16 to 256x256 cleanly using nearest-neighbor
             img_scaled = img.resize((256, 256), Image.Resampling.NEAREST)
             img_scaled.save(file_path)
             messagebox.showinfo("Success", f"Image successfully saved to:\n{file_path}")
@@ -525,21 +552,25 @@ class SendPage(tk.Frame):
     def start_transmission(self):
         active_tab = self.notebook.index(self.notebook.select())
         if active_tab == 0:
-            payload = self.text_input.get("1.0", "end-1c").strip().encode("utf-8")
+            text = self.text_input.get("1.0", "end-1c").strip()
+            payload = text.encode("utf-8")
+            payload_type = TYPE_TEXT
             self.status_lbl.config(text=f"Transmitting TEXT ({len(payload)} bytes)...", fg="#a6e3a1")
         elif active_tab == 1:
             if not self.raw_file_bytes:
                 messagebox.showwarning("No File", "Please choose a file first.")
                 return
             payload = self.raw_file_bytes
+            payload_type = TYPE_FILE
             self.status_lbl.config(text=f"Transmitting FILE ({len(payload)} bytes)...", fg="#a6e3a1")
         elif active_tab == 2:
             payload = self.get_packed_canvas_bytes()
+            payload_type = TYPE_IMAGE
             self.status_lbl.config(text=f"Transmitting 16x16 IMAGE ({len(payload)} bytes)...", fg="#a6e3a1")
         else:
             return
 
-        threading.Thread(target=lambda: transmit_payload(payload), daemon=True).start()
+        threading.Thread(target=lambda: transmit_payload(payload, payload_type), daemon=True).start()
 
 
 class ReceivePage(tk.Frame):
@@ -548,8 +579,6 @@ class ReceivePage(tk.Frame):
         self.controller = controller
         self.is_listening = False
         self.receiver_thread = None
-        
-        # Track 16x16 pixel data buffer for saving received images
         self.rx_pixel_data = [[0 for _ in range(16)] for _ in range(16)]
 
         nav = tk.Frame(self, bg="#181825", height=50)
@@ -581,7 +610,6 @@ class ReceivePage(tk.Frame):
                 x2, y2 = x1 + self.rx_cell_size, y1 + self.rx_cell_size
                 self.rx_rects[r][c] = self.rx_canvas.create_rectangle(x1, y1, x2, y2, fill="#000000", outline="#11111b")
 
-        # --- NEW: Save Received Image Button ---
         tk.Button(
             left_col, text="💾 Save Received Image (.png)", font=("Helvetica", 10, "bold"),
             bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=24, pady=6, cursor="hand2",
@@ -628,7 +656,7 @@ class ReceivePage(tk.Frame):
     def update_rx_pixel_safely(self, row, col, color_idx):
         def _paint():
             if 0 <= row < 16 and 0 <= col < 16 and 0 <= color_idx < 16:
-                self.rx_pixel_data[row][col] = color_idx  # Store in buffer
+                self.rx_pixel_data[row][col] = color_idx
                 self.rx_canvas.itemconfig(self.rx_rects[row][col], fill=PALETTE[color_idx])
         self.after(0, _paint)
 
@@ -649,22 +677,28 @@ class ReceivePage(tk.Frame):
         except Exception as e:
             messagebox.showerror("Error", f"Could not save received image:\n{e}")
 
-    def on_packet_received(self, payload):
+    def on_packet_received(self, full_payload):
         def _handle():
-            if len(payload) == 128:
-                self.append_log("[INFO] 16x16 Image packet fully verified by CRC!\n")
-            else:
+            # First byte of the payload is the type identifier
+            payload_type = full_payload[0]
+            actual_data = full_payload[1:]
+
+            if payload_type == TYPE_IMAGE:
+                self.append_log(f"[SUCCESS] 16x16 Image packet verified by CRC ({len(actual_data)} bytes).\n")
+            elif payload_type == TYPE_TEXT:
                 try:
-                    text_msg = payload.decode("utf-8")
+                    text_msg = actual_data.decode("utf-8")
                     self.append_log(f"Decoded Message:\n{text_msg}\n\n")
                 except UnicodeDecodeError:
-                    self.append_log(f"Received binary file ({len(payload)} bytes). Saving to ./received/\n")
-                    os.makedirs("received", exist_ok=True)
-                    filename = datetime.now().strftime("received_%Y%m%d_%H%M%S.bin")
-                    filepath = os.path.join("received", filename)
-                    with open(filepath, "wb") as f:
-                        f.write(payload)
-                    self.append_log(f"Saved to {filepath}\n")
+                    self.append_log(f"[ERROR] Text payload contained invalid UTF-8 bytes.\n")
+            elif payload_type == TYPE_FILE:
+                self.append_log(f"Received binary file ({len(actual_data)} bytes). Saving to ./received/\n")
+                os.makedirs("received", exist_ok=True)
+                filename = datetime.now().strftime("received_%Y%m%d_%H%M%S.bin")
+                filepath = os.path.join("received", filename)
+                with open(filepath, "wb") as f:
+                    f.write(actual_data)
+                self.append_log(f"Saved to {filepath}\n")
         self.after(0, _handle)
 
 
