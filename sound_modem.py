@@ -20,10 +20,12 @@ SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
 WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)  # 60ms analysis window
 STEP_SAMPLES = int(SAMPLE_RATE * 0.010)    # 10ms step during sync search
 
-# Payload Type Identifiers
+# Payload Type Identifiers (including ARQ Control Packets)
 TYPE_TEXT = 0x01
 TYPE_IMAGE = 0x02
 TYPE_FILE = 0x03
+TYPE_ACK = 0x04
+TYPE_NAK = 0x05
 
 # 16 Data Frequencies: 8000 Hz to 11750 Hz (250 Hz spacing)
 DATA_FREQS = np.array([8000 + i * 250 for i in range(16)])
@@ -53,7 +55,7 @@ PALETTE_RGB = [hex_to_rgb(c) for c in PALETTE]
 
 
 # ============================================================================
-# ENCODER FUNCTIONS
+# ENCODER & ACOUSTIC FUNCTIONS
 # ============================================================================
 def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, amplitude=0.8):
     tone_samples = int(sample_rate * duration)
@@ -73,46 +75,37 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     return wave
 
 def build_packet(data_payload, payload_type):
-    # Payload format: [Type ID (1B)] + [Actual Data]
     full_payload = bytes([payload_type]) + data_payload
     if len(full_payload) > 65535:
         raise ValueError("Payload too large for 2-byte length header.")
     
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
-    # Packet structure: [Length (2B)] + [Payload] + [CRC32 (4B)]
     packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
     return packet
 
-def transmit_payload(data_payload, payload_type):
-    try:
-        packet = build_packet(data_payload, payload_type)
-        bitstring = "".join(f"{byte:08b}" for byte in packet)
+def play_audio_waveform(data_payload, payload_type):
+    packet = build_packet(data_payload, payload_type)
+    bitstring = "".join(f"{byte:08b}" for byte in packet)
+    
+    waves = []
+    preamble_freqs = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
+    for freq in preamble_freqs:
+        waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
         
-        waves = []
-        preamble_freqs = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
-        for freq in preamble_freqs:
-            waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
-            
-        for i in range(0, len(bitstring), 4):
-            nibble_val = int(bitstring[i:i+4], 2)
-            freq = DATA_FREQS[nibble_val]
-            waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
-            
-        waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
-        full_signal = np.concatenate(waves).astype(np.float32)
+    for i in range(0, len(bitstring), 4):
+        nibble_val = int(bitstring[i:i+4], 2)
+        freq = DATA_FREQS[nibble_val]
+        waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
         
-        print(f"Transmitting {len(packet)} bytes ({len(waves)} symbols, {len(full_signal)/SAMPLE_RATE:.2f}s)...")
-        sd.play(full_signal, samplerate=SAMPLE_RATE)
-        sd.wait()
-        print("Transmission complete.")
-        return True
-    except Exception as e:
-        print(f"Transmission error: {e}")
-        return False
+    waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
+    full_signal = np.concatenate(waves).astype(np.float32)
+    
+    sd.play(full_signal, samplerate=SAMPLE_RATE)
+    sd.wait()
 
 
 # ============================================================================
-# DECODER FUNCTIONS & LISTENER
+# DECODER & LISTENER FUNCTIONS
 # ============================================================================
 def analyze_window(samples):
     samples = samples - np.mean(samples)
@@ -137,6 +130,125 @@ def decode_nibbles_to_bytes(nibbles):
     bitstring = "".join(format(n, "04b") for n in nibbles)
     byte_list = [int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8)]
     return bytes(byte_list)
+
+
+def listen_for_ack_nak(timeout=3.0):
+    """Listens briefly after transmission for an ACK or NAK response tone."""
+    start_time = time.time()
+    ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
+    state = "SEARCH_SYNC"
+    samples_until_next_read = 0
+    nibbles = []
+    expected_nibbles = None
+    expected_sync = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
+    sync_armed = False
+    best_sync_snr = 0.0
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
+            while time.time() - start_time < timeout:
+                audio, _ = stream.read(STEP_SAMPLES)
+                new_samples = audio[:, 0]
+                
+                ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
+                ring_buffer[-STEP_SAMPLES:] = new_samples
+                
+                if state == "SEARCH_SYNC":
+                    detected_sync = []
+                    last_snr = 0.0
+                    for k in range(6):
+                        end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))
+                        start_offset = end_offset - WINDOW_SAMPLES
+                        freq, snr, _ = analyze_window(ring_buffer[start_offset:end_offset])
+                        detected_sync.append(freq)
+                        if k == 5:
+                            last_snr = snr
+
+                    if detected_sync == expected_sync:
+                        if last_snr >= best_sync_snr:
+                            best_sync_snr = last_snr
+                            sync_armed = True
+                        elif sync_armed:
+                            state = "RECEIVE_DATA"
+                            nibbles = []
+                            expected_nibbles = None
+                            sync_armed = False
+                            best_sync_snr = 0.0
+                            samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
+                    elif sync_armed:
+                        state = "RECEIVE_DATA"
+                        nibbles = []
+                        expected_nibbles = None
+                        sync_armed = False
+                        best_sync_snr = 0.0
+                        samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
+                elif state == "RECEIVE_DATA":
+                    samples_until_next_read -= STEP_SAMPLES
+                    if samples_until_next_read <= 0:
+                        end_offset = -int(SAMPLE_RATE * 0.010)
+                        start_offset = end_offset - WINDOW_SAMPLES
+                        window = ring_buffer[start_offset:end_offset]
+                        
+                        freq, _, best_data_idx = analyze_window(window)
+                        nibbles.append(best_data_idx)
+                        current_nibble_count = len(nibbles)
+
+                        if current_nibble_count == 4:
+                            length_bytes = decode_nibbles_to_bytes(nibbles[:4])
+                            payload_len = struct.unpack('>H', length_bytes)[0]
+                            expected_nibbles = (2 + payload_len + 4) * 2
+
+                        if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
+                            raw_bytes = decode_nibbles_to_bytes(nibbles)
+                            full_payload = raw_bytes[2:-4]
+                            received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
+                            calculated_crc = zlib.crc32(full_payload) & 0xFFFFFFFF
+                            
+                            if received_crc == calculated_crc and len(full_payload) > 0:
+                                p_type = full_payload[0]
+                                if p_type == TYPE_ACK:
+                                    return "ACK"
+                                elif p_type == TYPE_NAK:
+                                    return "NAK"
+                            return None
+                            
+                        samples_until_next_read += SYMBOL_SAMPLES
+    except Exception:
+        pass
+    return None
+
+
+def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3):
+    """Stop-and-Wait ARQ sender loop."""
+    for attempt in range(1, max_retries + 1):
+        callback_status(f"Transmitting (Attempt {attempt}/{max_retries})...", "#89b4fa")
+        print(f"Transmitting packet (Attempt {attempt}/{max_retries})...")
+        
+        try:
+            play_audio_waveform(data_payload, payload_type)
+        except Exception as e:
+            callback_status(f"Transmission error: {e}", "#f38ba8")
+            return False
+        
+        callback_status(f"Listening for ACK/NAK response...", "#f9e2af")
+        print("Listening for acknowledgment...")
+        time.sleep(0.2)  # Brief breathing room before listening
+        
+        response = listen_for_ack_nak(timeout=3.5)
+        if response == "ACK":
+            callback_status("Transmission SUCCESS! (ACK received)", "#a6e3a1")
+            print("Acknowledgment (ACK) received successfully.")
+            return True
+        elif response == "NAK":
+            callback_status(f"CRC Mismatch (NAK). Retrying...", "#fab387")
+            print("Receiver requested retransmission (NAK).")
+        else:
+            callback_status(f"No response heard. Retrying...", "#fab387")
+            print("No response heard (timeout). Retrying...")
+            
+    callback_status("Transmission FAILED after max retries.", "#f38ba8")
+    print("Transmission failed after max retries.")
+    return False
 
 
 class ReceiverThread(threading.Thread):
@@ -218,14 +330,11 @@ class ReceiverThread(threading.Thread):
                             nibbles.append(best_data_idx)
                             current_nibble_count = len(nibbles)
 
-                            # 1. Header decoded at 4 nibbles (2-byte length)
                             if current_nibble_count == 4:
                                 length_bytes = decode_nibbles_to_bytes(nibbles[:4])
                                 payload_len = struct.unpack('>H', length_bytes)[0]
                                 expected_nibbles = (2 + payload_len + 4) * 2
-                                self.callback_log(f"  Header decoded: expecting {payload_len} bytes payload...\n")
 
-                            # 2. Type ID decoded at 6 nibbles (next byte after length)
                             elif current_nibble_count == 6:
                                 type_bytes = decode_nibbles_to_bytes(nibbles[4:6])
                                 payload_type = type_bytes[0]
@@ -237,15 +346,13 @@ class ReceiverThread(threading.Thread):
                                 else:
                                     self.callback_log("  Detected Binary File stream...\n")
 
-                            # 3. Live Pixel Rendering if it's explicitly marked as an image stream
                             elif current_nibble_count > 6 and is_image_packet:
-                                pixel_idx = current_nibble_count - 7  # 0-indexed pixel position after type byte
+                                pixel_idx = current_nibble_count - 7
                                 if pixel_idx < 256:
                                     r = pixel_idx // 16
                                     c = pixel_idx % 16
                                     self.callback_pixel_received(r, c, best_data_idx)
 
-                            # 4. Packet completion check
                             if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
                                 raw_bytes = decode_nibbles_to_bytes(nibbles)
                                 full_payload = raw_bytes[2:-4]
@@ -253,10 +360,16 @@ class ReceiverThread(threading.Thread):
                                 calculated_crc = zlib.crc32(full_payload) & 0xFFFFFFFF
                                 
                                 if received_crc == calculated_crc:
-                                    self.callback_log(f"[SUCCESS] CRC Valid! Received packet successfully.\n")
+                                    self.callback_log(f"[SUCCESS] CRC Valid! Sending ACK back...\n")
                                     self.callback_packet_received(full_payload)
+                                    # Send ACK acoustic response back to sender
+                                    time.sleep(0.2)
+                                    play_audio_waveform(b"", TYPE_ACK)
                                 else:
-                                    self.callback_log(f"[ERROR] CRC Mismatch! (Got {received_crc:#x}, expected {calculated_crc:#x})\n")
+                                    self.callback_log(f"[ERROR] CRC Mismatch! Sending NAK request for resend...\n")
+                                    # Send NAK acoustic response back to sender
+                                    time.sleep(0.2)
+                                    play_audio_waveform(b"", TYPE_NAK)
                                     
                                 state = "SEARCH_SYNC"
                                 ring_buffer.fill(0)
@@ -275,7 +388,7 @@ class ReceiverThread(threading.Thread):
 class SoundModemApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Acoustic Data & Image Transceiver (16x16)")
+        self.title("Acoustic Data & Image Transceiver with ARQ")
         self.geometry("900x680")
         self.configure(bg="#1e1e2e")
         self.resizable(False, False)
@@ -306,7 +419,7 @@ class HomePage(tk.Frame):
         title = tk.Label(self, text="SONIC MODEM", font=("Helvetica", 32, "bold"), fg="#cdd6f4", bg="#1e1e2e")
         title.pack(pady=(120, 10))
 
-        subtitle = tk.Label(self, text="Acoustic Text & 16x16 Pixel Art Transceiver", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
+        subtitle = tk.Label(self, text="Acoustic Transceiver with Automatic Resend (ARQ)", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
         subtitle.pack(pady=(0, 60))
 
         btn_frame = tk.Frame(self, bg="#1e1e2e")
@@ -341,7 +454,7 @@ class SendPage(tk.Frame):
             bg="#313244", fg="#11111b", highlightbackground="#181825",
             command=lambda: controller.show_frame("HomePage")
         ).pack(side="left", padx=15, pady=10)
-        tk.Label(nav, text="TRANSMIT DATA / 16x16 IMAGE", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
+        tk.Label(nav, text="TRANSMIT DATA WITH ARQ", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
 
         style = ttk.Style()
         style.theme_use("default")
@@ -380,7 +493,7 @@ class SendPage(tk.Frame):
         tk.Label(self.tab_text, text="Enter UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
         self.text_input = tk.Text(self.tab_text, height=14, font=("Courier", 13), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4", relief="flat")
         self.text_input.pack(fill="x", padx=20, pady=10)
-        self.text_input.insert("1.0", "Hello World! Testing acoustic FSK modem.")
+        self.text_input.insert("1.0", "Hello World! Testing acoustic FSK modem with ARQ.")
 
     def _build_file_tab(self):
         self.selected_file_path = None
@@ -549,28 +662,33 @@ class SendPage(tk.Frame):
             packed.append((high << 4) | low)
         return bytes(packed)
 
+    def update_status(self, text, color):
+        def _set():
+            self.status_lbl.config(text=text, fg=color)
+        self.after(0, _set)
+
     def start_transmission(self):
         active_tab = self.notebook.index(self.notebook.select())
         if active_tab == 0:
             text = self.text_input.get("1.0", "end-1c").strip()
             payload = text.encode("utf-8")
             payload_type = TYPE_TEXT
-            self.status_lbl.config(text=f"Transmitting TEXT ({len(payload)} bytes)...", fg="#a6e3a1")
         elif active_tab == 1:
             if not self.raw_file_bytes:
                 messagebox.showwarning("No File", "Please choose a file first.")
                 return
             payload = self.raw_file_bytes
             payload_type = TYPE_FILE
-            self.status_lbl.config(text=f"Transmitting FILE ({len(payload)} bytes)...", fg="#a6e3a1")
         elif active_tab == 2:
             payload = self.get_packed_canvas_bytes()
             payload_type = TYPE_IMAGE
-            self.status_lbl.config(text=f"Transmitting 16x16 IMAGE ({len(payload)} bytes)...", fg="#a6e3a1")
         else:
             return
 
-        threading.Thread(target=lambda: transmit_payload(payload, payload_type), daemon=True).start()
+        threading.Thread(
+            target=lambda: transmit_with_arq(payload, payload_type, self.update_status, max_retries=3),
+            daemon=True
+        ).start()
 
 
 class ReceivePage(tk.Frame):
@@ -679,20 +797,19 @@ class ReceivePage(tk.Frame):
 
     def on_packet_received(self, full_payload):
         def _handle():
-            # First byte of the payload is the type identifier
             payload_type = full_payload[0]
             actual_data = full_payload[1:]
 
             if payload_type == TYPE_IMAGE:
-                self.append_log(f"[SUCCESS] 16x16 Image packet verified by CRC ({len(actual_data)} bytes).\n")
+                self.append_log(f"[SUCCESS] 16x16 Image packet verified by CRC! Sent ACK.\n")
             elif payload_type == TYPE_TEXT:
                 try:
                     text_msg = actual_data.decode("utf-8")
-                    self.append_log(f"Decoded Message:\n{text_msg}\n\n")
+                    self.append_log(f"Decoded Message:\n{text_msg}\n[SUCCESS] Sent ACK.\n\n")
                 except UnicodeDecodeError:
                     self.append_log(f"[ERROR] Text payload contained invalid UTF-8 bytes.\n")
             elif payload_type == TYPE_FILE:
-                self.append_log(f"Received binary file ({len(actual_data)} bytes). Saving to ./received/\n")
+                self.append_log(f"Received binary file ({len(actual_data)} bytes). Saving to ./received/ [SUCCESS] Sent ACK.\n")
                 os.makedirs("received", exist_ok=True)
                 filename = datetime.now().strftime("received_%Y%m%d_%H%M%S.bin")
                 filepath = os.path.join("received", filename)
