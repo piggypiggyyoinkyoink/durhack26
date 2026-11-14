@@ -400,7 +400,7 @@ class ReceiverThread(threading.Thread):
                                     p_info = assembled_payloads[payload_type]
                                     if len(p_info['chunks']) == p_info['total_chunks']:
                                         # Reconstruct complete payload
-                                        complete_data = b"".join(p_info['chunks][i] for i in range(p_info['total_chunks']))
+                                        complete_data = b"".join(p_info['chunks'][i] for i in range(p_info['total_chunks']))
                                         full_complete_payload = bytes([payload_type]) + complete_data
                                         self.callback_packet_fully_received(full_complete_payload)
                                         del assembled_payloads[payload_type]
