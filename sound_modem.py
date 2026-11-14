@@ -108,6 +108,9 @@ def play_audio_waveform(data_payload, payload_type, seq_num=0, total_packets=1):
         nibble_val = int(bitstring[i:i+4], 2)
         freq = DATA_FREQS[nibble_val]
         waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
+
+    # Trailing postamble tone to protect the final CRC nibble from tail cutoff/echo
+    waves.append(generate_tone(SYNC_FREQ_A, TONE_DURATION, SYMBOL_DURATION))
         
     waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
     full_signal = np.concatenate(waves).astype(np.float32)
@@ -169,7 +172,7 @@ def listen_for_ack_nak(timeout=4.0):
                     detected_sync = []
                     last_snr = 0.0
                     for k in range(6):
-                        end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))
+                        end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))
                         start_offset = end_offset - WINDOW_SAMPLES
                         freq, snr, _ = analyze_window(ring_buffer[start_offset:end_offset])
                         detected_sync.append(freq)
@@ -197,7 +200,7 @@ def listen_for_ack_nak(timeout=4.0):
                 elif state == "RECEIVE_DATA":
                     samples_until_next_read -= STEP_SAMPLES
                     if samples_until_next_read <= 0:
-                        end_offset = -int(SAMPLE_RATE * 0.010)
+                        end_offset = -int(SAMPLE_RATE * 0.025)
                         start_offset = end_offset - WINDOW_SAMPLES
                         window = ring_buffer[start_offset:end_offset]
                         
