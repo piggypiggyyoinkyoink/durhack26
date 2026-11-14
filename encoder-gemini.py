@@ -7,13 +7,45 @@ PREAMBLE_BITS = "101010101010"   # 12-bit clock training
 SYNC_BYTE = b"\x7e"              # 01111110 frame delimiter
 
 
+def hamming74_encode_nibble(nibble: int) -> str:
+    """Encode a 4-bit integer (0..15) into a 7-bit Hamming(7,4) codeword string."""
+    d1 = (nibble >> 3) & 1
+    d2 = (nibble >> 2) & 1
+    d3 = (nibble >> 1) & 1
+    d4 = nibble & 1
+
+    # Standard even-parity Hamming(7,4) positions: [p1, p2, d1, p3, d2, d3, d4]
+    p1 = d1 ^ d2 ^ d4
+    p2 = d1 ^ d3 ^ d4
+    p3 = d2 ^ d3 ^ d4
+
+    return f"{p1}{p2}{d1}{p3}{d2}{d3}{d4}"
+
+
+def hamming74_encode_bytes(data: bytes) -> str:
+    """Encode each byte into two 7-bit Hamming(7,4) codewords (14 bits/byte)."""
+    bits = []
+    for byte in data:
+        high = (byte >> 4) & 0x0F
+        low = byte & 0x0F
+        bits.append(hamming74_encode_nibble(high))
+        bits.append(hamming74_encode_nibble(low))
+    return "".join(bits)
+
+
 def build_frame(payload: bytes) -> str:
-    """Frame format: [PREAMBLE] [SYNC 0x7E] [LEN (2B)] [PAYLOAD] [CRC32 (4B)]"""
+    """
+    Frame format:
+      Raw:     [PREAMBLE (12b)] [SYNC 0x7E (8b)]
+      Encoded: Hamming(7,4) over [LEN (2B)] [PAYLOAD] [CRC32 (4B)]
+    """
     header = struct.pack(">H", len(payload))
     crc = struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
-    frame_bytes = SYNC_BYTE + header + payload + crc
-    frame_bits = "".join(f"{b:08b}" for b in frame_bytes)
-    return PREAMBLE_BITS + frame_bits
+    protected_bytes = header + payload + crc
+
+    sync_bits = "".join(f"{b:08b}" for b in SYNC_BYTE)
+    encoded_body = hamming74_encode_bytes(protected_bytes)
+    return PREAMBLE_BITS + sync_bits + encoded_body
 
 
 def transmit_bitstring(
@@ -34,7 +66,6 @@ def transmit_bitstring(
     envelope[:fade_len] = ramp
     envelope[-fade_len:] = ramp[::-1]
 
-    # Pre-render the two bit waveforms
     wave_0 = amplitude * np.sin(2 * np.pi * f0 * t) * envelope
     wave_1 = amplitude * np.sin(2 * np.pi * f1 * t) * envelope
 
@@ -53,6 +84,6 @@ if __name__ == "__main__":
         data = f.read()
 
     bits = build_frame(data)
-    print(f"Transmitting {len(data)} bytes ({len(bits)} bits, ~{len(bits)*0.06:.1f}s)...")
+    print(f"Transmitting {len(data)} bytes ({len(bits)} bits with Hamming(7,4), ~{len(bits)*0.06:.1f}s)...")
     transmit_bitstring(bits)
     print("Done.")
