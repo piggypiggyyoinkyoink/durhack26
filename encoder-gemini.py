@@ -47,7 +47,6 @@ def transmit_bitstring(
     sd.play(signal.astype(np.float32), samplerate=sample_rate)
     sd.wait()
 
-
 if __name__ == "__main__":
     with open("test.txt", "rb") as f:
         data = f.read()
