@@ -136,22 +136,35 @@ def play_audio_waveform(packet_bytes):
 # DECODER (one streaming demodulator shared by receiver AND ARQ listener)
 # ============================================================================
 def analyze_window(samples):
-    samples = samples - np.mean(samples)
-    windowed = samples * HANN
-    spectrum = np.abs(np.fft.rfft(windowed, n=FFT_SIZE))
 
-    band_mask = (FFT_FREQS >= 7500) & (FFT_FREQS <= 13500)
+    samples = samples - np.mean(samples)
+
+    windowed = samples * HANN
+
+    spectrum = np.abs(
+        np.fft.rfft(windowed, n=FFT_SIZE)
+    )
+
+    band_mask = (
+        (FFT_FREQS >= 7500) &
+        (FFT_FREQS <= 13500)
+    )
+
     noise_floor = np.median(spectrum[band_mask]) + 1e-9
 
     strengths = spectrum[FREQ_BINS]
+
     best_idx = int(np.argmax(strengths))
+
     peak_val = strengths[best_idx]
 
     snr = peak_val / noise_floor
+
     best_data_idx = int(np.argmax(strengths[:16]))
 
     if snr < SNR_THRESHOLD:
         return None, snr, best_data_idx
+
     return ALL_FREQS[best_idx], snr, best_data_idx
 
 def decode_nibbles_to_bytes(nibbles):
@@ -160,16 +173,18 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes(byte_list)
 
 
+
 class PacketDemodulator:
     """
-    Feed it STEP_SAMPLES (10 ms) of audio at a time via feed().
-    Returns None, or an event tuple:
-        ("sync", None)      preamble locked, packet data is now being read
-        ("ok",   payload)   packet finished and CRC verified
-        ("bad",  None)      packet finished but CRC / length was invalid
-    max_payload_len rejects absurd length fields (noise) instead of waiting
-    forever for thousands of nibbles that will never come.
+    Streaming FSK demodulator.
+
+    Feed STEP_SAMPLES (10 ms) of audio at a time.
+    Returns:
+        ("sync", None)    Preamble detected
+        ("ok", payload)   Packet successfully decoded and CRC verified
+        ("bad", None)     Invalid packet or CRC failure
     """
+
     def __init__(self, max_payload_len):
         self.max_payload_len = max_payload_len
         self.reset()
@@ -181,11 +196,9 @@ class PacketDemodulator:
         self.nibbles = []
         self.expected_nibbles = None
         self.sync_armed = False
-        self.best_sync_snr = 0.0
 
     @property
     def idle(self):
-        """True when we are not in the middle of (or about to start) a packet."""
         return self.state == "SEARCH_SYNC" and not self.sync_armed
 
     def _lock(self):
@@ -193,59 +206,107 @@ class PacketDemodulator:
         self.nibbles = []
         self.expected_nibbles = None
         self.sync_armed = False
-        self.best_sync_snr = 0.0
+
+        # Wait for the remainder of the first data symbol.
         self.samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
 
     def feed(self, new_samples):
+
         self.ring = np.roll(self.ring, -STEP_SAMPLES)
         self.ring[-STEP_SAMPLES:] = new_samples
 
+        # --------------------------------------------------
+        # SEARCH FOR SYNCHRONIZATION PREAMBLE
+        # --------------------------------------------------
         if self.state == "SEARCH_SYNC":
+
             detected = []
-            last_snr = 0.0
+
             for k in range(6):
+
                 end = -((5 - k) * SYMBOL_SAMPLES + GUARD_SAMPLES)
-                freq, snr, _ = analyze_window(self.ring[end - WINDOW_SAMPLES:end])
+
+                freq, snr, _ = analyze_window(
+                    self.ring[end - WINDOW_SAMPLES:end]
+                )
+
                 detected.append(freq)
-                last_snr = snr
 
             if detected == EXPECTED_SYNC:
-                if last_snr >= self.best_sync_snr:
-                    self.best_sync_snr = last_snr
-                    self.sync_armed = True
-                elif self.sync_armed:
-                    self._lock()
-                    return ("sync", None)
+
+                self.sync_armed = True
+                return None
+
             elif self.sync_armed:
+
                 self._lock()
                 return ("sync", None)
+
             return None
 
-        # ---- RECEIVE_DATA ----
+        # --------------------------------------------------
+        # RECEIVE DATA SYMBOLS
+        # --------------------------------------------------
         self.samples_until_next_read -= STEP_SAMPLES
+
         if self.samples_until_next_read > 0:
             return None
+
         self.samples_until_next_read += SYMBOL_SAMPLES
 
-        window = self.ring[-GUARD_SAMPLES - WINDOW_SAMPLES:-GUARD_SAMPLES]
-        _, _, best_data_idx = analyze_window(window)
+        window = self.ring[
+            -GUARD_SAMPLES - WINDOW_SAMPLES:-GUARD_SAMPLES
+        ]
+
+        freq, snr, best_data_idx = analyze_window(window)
+
+        # Reject noise and invalid frequencies.
+        if freq is None or freq not in DATA_FREQS:
+            self.reset()
+            return ("bad", None)
+
         self.nibbles.append(best_data_idx)
 
+        # --------------------------------------------------
+        # DECODE PACKET LENGTH
+        # --------------------------------------------------
         if len(self.nibbles) == 4:
-            length = struct.unpack('>H', decode_nibbles_to_bytes(self.nibbles))[0]
+
+            length_bytes = decode_nibbles_to_bytes(self.nibbles)
+
+            length = struct.unpack(">H", length_bytes)[0]
+
             if length < 1 or length > self.max_payload_len:
                 self.reset()
                 return ("bad", None)
+
             self.expected_nibbles = (2 + length + 4) * 2
 
-        if self.expected_nibbles is not None and len(self.nibbles) >= self.expected_nibbles:
+        # --------------------------------------------------
+        # COMPLETE PACKET AND VERIFY CRC
+        # --------------------------------------------------
+        if (
+            self.expected_nibbles is not None
+            and len(self.nibbles) >= self.expected_nibbles
+        ):
+
             raw = decode_nibbles_to_bytes(self.nibbles)
+
             payload = raw[2:-4]
-            received_crc = struct.unpack('>I', raw[-4:])[0]
-            ok = received_crc == (zlib.crc32(payload) & 0xFFFFFFFF)
+
+            received_crc = struct.unpack(">I", raw[-4:])[0]
+
+            calculated_crc = zlib.crc32(payload) & 0xFFFFFFFF
+
             self.reset()
-            return ("ok", payload) if ok else ("bad", None)
+
+            if received_crc == calculated_crc:
+                return ("ok", payload)
+
+            return ("bad", None)
+
         return None
+
 
 
 # ============================================================================
