@@ -33,4 +33,4 @@ def transmit_bitstring(bitstring, frequency_0, frequency_1, duration=0.1, sample
 file_bytes = read_file("a.txt")
 bitstring = get_bitstring(file_bytes)
 print(bitstring)
-transmit_bitstring(bitstring, frequency_0=2000.0, frequency_1=3000.0, duration=0.04, amplitude=1)
+transmit_bitstring(bitstring, frequency_0=12000.0, frequency_1=13000.0, duration=0.1, amplitude=1)
