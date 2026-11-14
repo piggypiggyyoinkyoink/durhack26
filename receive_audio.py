@@ -1,74 +1,27 @@
-"""Continuously receive encoded audio and save each transmission separately."""
+FREQUENCY_0 = 3000.0
+FREQUENCY_1 = 4000.0
+PULSE_DURATION = 0.25
 
-FREQUENCY_0 = 12000.0
-FREQUENCY_1 = 13000.0
-PULSE_DURATION = 0.1
+"""Record the tones produced by binary_audio_enc.py and reconstruct the file."""
 
 import argparse
-from pathlib import Path
-from queue import Empty, Queue
 import sys
+from threading import Lock
 
 import numpy as np
 import sounddevice as sd
 
 
-SILENCE_DURATION = 0.2
-MIN_SIGNAL_RMS = 0.005
+def record_until_stopped(sample_rate: int, block_size: int) -> np.ndarray:
+    """Record microphone input until the user presses Ctrl+C."""
+    chunks: list[np.ndarray] = []
+    lock = Lock()
 
+    def callback(indata: np.ndarray, _frames: int, _time: object, _status: object) -> None:
+        with lock:
+            chunks.append(indata[:, 0].copy())
 
-def save_session(
-    chunks: list[np.ndarray],
-    output_base: Path,
-    session_number: int,
-    sample_rate: int,
-    pulse_duration: float,
-) -> bool:
-    """Decode and save one transmission, returning whether a file was written."""
-    data = decode(np.concatenate(chunks), sample_rate, pulse_duration)
-    if not data:
-        return False
-
-    if session_number == 0:
-        output_path = output_base
-    else:
-        output_path = output_base.with_name(
-            f"{output_base.stem}_{session_number}{output_base.suffix}"
-        )
-    output_path.write_bytes(data)
-    print(f"Wrote {len(data)} bytes to {output_path}")
-    return True
-
-
-def record_sessions(
-    output_base: Path,
-    sample_rate: int,
-    pulse_duration: float,
-    block_size: int,
-) -> None:
-    """Listen continuously and save each transmission after sustained silence."""
-    blocks: Queue[np.ndarray] = Queue()
-
-    def callback(
-        indata: np.ndarray,
-        _frames: int,
-        _time: object,
-        status: object,
-    ) -> None:
-        if status:
-            print(f"Audio input warning: {status}", file=sys.stderr)
-        blocks.put(indata[:, 0].copy())
-
-    block_duration = block_size / sample_rate
-    silence_blocks_required = max(1, int(SILENCE_DURATION / block_duration))
-    calibration_blocks_required = max(1, int(1 / block_duration))
-    calibration_rms: list[float] = []
-    noise_threshold = MIN_SIGNAL_RMS
-    session: list[np.ndarray] = []
-    silent_blocks = 0
-    session_number = 0
-
-    print("Listening continuously. Each transmission is saved after 0.75 seconds of silence.")
+    print("Listening... start binary_audio_enc.py, then press Ctrl+C when it finishes.")
     try:
         with sd.InputStream(
             samplerate=sample_rate,
@@ -78,47 +31,14 @@ def record_sessions(
             callback=callback,
         ):
             while True:
-                try:
-                    block = blocks.get(timeout=0.25)
-                except Empty:
-                    continue
-
-                rms = float(np.sqrt(np.mean(block * block)))
-                if len(calibration_rms) < calibration_blocks_required:
-                    calibration_rms.append(rms)
-                    if len(calibration_rms) == calibration_blocks_required:
-                        noise_threshold = max(
-                            MIN_SIGNAL_RMS, float(np.median(calibration_rms)) * 4
-                        )
-
-                if rms >= noise_threshold:
-                    if not session:
-                        print("Transmission detected.")
-                    session.append(block)
-                    silent_blocks = 0
-                elif session:
-                    session.append(block)
-                    silent_blocks += 1
-                    if silent_blocks >= silence_blocks_required:
-                        if save_session(
-                            session[:-silent_blocks],
-                            output_base,
-                            session_number,
-                            sample_rate,
-                            pulse_duration,
-                        ):
-                            session_number += 1
-                        session = []
-                        silent_blocks = 0
+                sd.sleep(250)
     except KeyboardInterrupt:
-        if session:
-            save_session(
-                session[:-silent_blocks] if silent_blocks else session,
-                output_base,
-                session_number,
-                sample_rate,
-                pulse_duration,
-            )
+        pass
+
+    with lock:
+        if not chunks:
+            return np.empty(0, dtype=np.float32)
+        return np.concatenate(chunks)
 
 
 def find_signal_start(signal: np.ndarray, sample_rate: int) -> int:
@@ -175,12 +95,19 @@ def main() -> int:
     if args.sample_rate <= 0 or args.pulse_duration <= 0 or args.block_size <= 0:
         parser.error("sample rate, pulse duration, and block size must be positive")
 
-    record_sessions(
-        Path(args.output),
-        args.sample_rate,
-        args.pulse_duration,
-        args.block_size,
-    )
+    signal = record_until_stopped(args.sample_rate, args.block_size)
+    if signal.size == 0:
+        print("No audio was recorded.", file=sys.stderr)
+        return 1
+
+    data = decode(signal, args.sample_rate, args.pulse_duration)
+    if not data:
+        print("No complete encoded bytes were detected.", file=sys.stderr)
+        return 1
+
+    with open(args.output, "wb") as output_file:
+        output_file.write(data)
+    print(f"Wrote {len(data)} bytes to {args.output}")
     return 0
 
 
