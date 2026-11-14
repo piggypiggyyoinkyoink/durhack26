@@ -19,6 +19,7 @@ Usage:
   python decoder.py --device 2 --out-dir captures
 """
 import argparse
+from html import parser
 import os
 import queue
 import time
@@ -201,7 +202,7 @@ def listen(args):
     print(f"Listening at {sr} Hz  (0 = {args.f0:.0f} Hz, 1 = {args.f1:.0f} Hz, "
           f"{args.bit_duration * 1000:.0f} ms/bit). Ctrl+C to stop.")
 
-    with sd.InputStream(samplerate=sr, channels=2, blocksize=block_size,
+    with sd.InputStream(samplerate=sr, channels=1, blocksize=block_size,
                         dtype="float32", device=args.device, callback=callback):
         try:
             while True:
@@ -209,6 +210,13 @@ def listen(args):
                 if len(block) != block_size:
                     continue
                 active = analyzer.is_active(block)
+
+                rms = float(np.sqrt(np.mean(block ** 2)))
+                spectrum = np.abs(np.fft.rfft(block)) ** 2
+                total = spectrum[1:].sum()
+                tone_frac = spectrum[analyzer.bins].sum() / total if total > 0 else 0
+                if rms > 0.0005:  # print when there's any noticeable sound
+                    print(f"DEBUG: RMS={rms:.5f}, ToneFrac={tone_frac:.2f}, Active={active}")
 
                 if state == "idle":
                     preroll.append(block)
@@ -257,9 +265,9 @@ def main():
     parser.add_argument("--f0", type=float, default=12000.0, help="frequency for bit 0")
     parser.add_argument("--f1", type=float, default=13000.0, help="frequency for bit 1")
     parser.add_argument("--bit-duration", type=float, default=0.1, help="seconds per bit")
-    parser.add_argument("--min-rms", type=float, default=0.005,
-                        help="minimum block loudness to count as signal (raise in noisy rooms)")
-    parser.add_argument("--min-tone-fraction", type=float, default=0.4,
+    parser.add_argument("--min-rms", type=float, default=0.001,
+                        help="minimum block loudness to count as signal")
+    parser.add_argument("--min-tone-fraction", type=float, default=0.15,
                         help="fraction of block power that must sit at the two tones")
     parser.add_argument("--silence-timeout", type=float, default=0.5,
                         help="seconds without tones that ends a transmission")
