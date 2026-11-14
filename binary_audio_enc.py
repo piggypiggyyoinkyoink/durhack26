@@ -30,7 +30,7 @@ def transmit_bitstring(bitstring, frequency_0, frequency_1, duration=0.1, sample
     sd.play(full_signal, samplerate=sample_rate)
     sd.wait()
 
-file_bytes = read_file("a.txt")
+file_bytes = read_file("test.txt")
 bitstring = get_bitstring(file_bytes)
 print(bitstring)
 transmit_bitstring(bitstring, frequency_0=12000.0, frequency_1=13000.0, duration=0.1, amplitude=1)
