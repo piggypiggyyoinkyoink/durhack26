@@ -14,13 +14,14 @@ from PIL import Image
 # MODEM CONFIGURATION & CONSTANTS
 # ============================================================================
 SAMPLE_RATE = 44100
-SYMBOL_DURATION = 0.020  # 100 ms total per symbol
-TONE_DURATION = 0.016    # 80 ms tone + 20 ms guard silence
-SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
-WINDOW_SAMPLES = int(SAMPLE_RATE * 0.012)  # 60ms analysis window
-STEP_SAMPLES = int(SAMPLE_RATE * 0.002)    # 10ms step during sync search
+SYMBOL_DURATION = 0.080  # 80 ms per symbol (3528 samples)
+TONE_DURATION = 0.065    # 65 ms tone + 15 ms guard silence
+SYMBOL_SAMPLES = 3528    # Exact: 44100 * 0.080
+WINDOW_SAMPLES = 1764    # Exact: 40 ms FFT window (12.5 ms margin on both sides)
+STEP_SAMPLES = 294       # Exact divisor: 3528 / 12 = 294 (6.67 ms step)
+GUARD_OFFSET = 1213      # Centers 40 ms window inside 65 ms tone (27.5 ms from slot end)
 
-CHUNK_SIZE = 32  # Bytes per packet chunk (32 bytes = 6.4s audio per chunk)
+CHUNK_SIZE = 32  # Bytes per packet chunk
 
 # Payload Type Identifiers
 TYPE_TEXT = 0x01
@@ -77,11 +78,6 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     return wave
 
 def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
-    """
-    Packet format:
-    [2B Length] + [1B Type | 2B SeqNum | 2B TotalPackets | N-B Data] + [4B CRC32]
-    For ACK/NAK, data_payload holds the 2-byte target sequence number.
-    """
     if payload_type in (TYPE_ACK, TYPE_NAK):
         full_payload = bytes([payload_type]) + data_payload
     else:
@@ -92,8 +88,7 @@ def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
         raise ValueError("Payload too large for 2-byte length header.")
     
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
-    packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
-    return packet
+    return struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
 
 def play_audio_waveform(data_payload, payload_type, seq_num=0, total_packets=1):
     packet = build_packet(data_payload, payload_type, seq_num, total_packets)
@@ -109,9 +104,8 @@ def play_audio_waveform(data_payload, payload_type, seq_num=0, total_packets=1):
         freq = DATA_FREQS[nibble_val]
         waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
 
-    # Trailing postamble tone to protect the final CRC nibble from tail cutoff/echo
+    # Postamble + tail silence so the final CRC nibble never gets clipped
     waves.append(generate_tone(SYNC_FREQ_A, TONE_DURATION, SYMBOL_DURATION))
-        
     waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
     full_signal = np.concatenate(waves).astype(np.float32)
     
@@ -136,10 +130,39 @@ def analyze_window(samples):
     
     snr = peak_val / noise_floor
     best_data_idx = int(np.argmax(strengths[:16]))
+    best_data_val = strengths[best_data_idx]
     
     if snr < SNR_THRESHOLD:
-        return None, snr, best_data_idx
-    return ALL_FREQS[best_idx], snr, best_data_idx
+        return None, snr, best_data_idx, best_data_val
+    return ALL_FREQS[best_idx], snr, best_data_idx, best_data_val
+
+def decode_tracked_symbol(ring_buffer):
+    """
+    Evaluates center window and +-1 step neighbors to track soundcard clock drift
+    and pick the cleanest reading inside the 65ms tone.
+    Returns (best_data_idx, timing_nudge_samples).
+    """
+    # Center, Early (-1 step), Late (+1 step within buffer)
+    offsets = [
+        (GUARD_OFFSET, 0),
+        (GUARD_OFFSET + STEP_SAMPLES, -STEP_SAMPLES),
+        (GUARD_OFFSET - STEP_SAMPLES, STEP_SAMPLES),
+    ]
+    best_val = -1.0
+    best_nibble = 0
+    best_nudge = 0
+
+    for end_off, nudge in offsets:
+        start_off = end_off + WINDOW_SAMPLES
+        _, _, nibble, val = analyze_window(ring_buffer[-start_off:-end_off])
+        # Slight preference for center (nudge == 0) unless neighbor is clearly stronger
+        weighted_val = val * (1.08 if nudge == 0 else 1.0)
+        if weighted_val > best_val:
+            best_val = weighted_val
+            best_nibble = nibble
+            best_nudge = nudge
+
+    return best_nibble, best_nudge
 
 def decode_nibbles_to_bytes(nibbles):
     bitstring = "".join(format(n, "04b") for n in nibbles)
@@ -147,8 +170,7 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes(byte_list)
 
 
-def listen_for_ack_nak(timeout=4.0):
-    """Returns tuple: (status_str, target_seq_num) e.g. ('ACK', 0) or ('NAK', 2)."""
+def listen_for_ack_nak(timeout=5.0):
     start_time = time.time()
     ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
     state = "SEARCH_SYNC"
@@ -163,18 +185,16 @@ def listen_for_ack_nak(timeout=4.0):
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
             while time.time() - start_time < timeout:
                 audio, _ = stream.read(STEP_SAMPLES)
-                new_samples = audio[:, 0]
-                
                 ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
-                ring_buffer[-STEP_SAMPLES:] = new_samples
+                ring_buffer[-STEP_SAMPLES:] = audio[:, 0]
                 
                 if state == "SEARCH_SYNC":
                     detected_sync = []
                     last_snr = 0.0
                     for k in range(6):
-                        end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))
+                        end_offset = -((5 - k) * SYMBOL_SAMPLES + GUARD_OFFSET)
                         start_offset = end_offset - WINDOW_SAMPLES
-                        freq, snr, _ = analyze_window(ring_buffer[start_offset:end_offset])
+                        freq, snr, _, _ = analyze_window(ring_buffer[start_offset:end_offset])
                         detected_sync.append(freq)
                         if k == 5:
                             last_snr = snr
@@ -200,11 +220,7 @@ def listen_for_ack_nak(timeout=4.0):
                 elif state == "RECEIVE_DATA":
                     samples_until_next_read -= STEP_SAMPLES
                     if samples_until_next_read <= 0:
-                        end_offset = -int(SAMPLE_RATE * 0.025)
-                        start_offset = end_offset - WINDOW_SAMPLES
-                        window = ring_buffer[start_offset:end_offset]
-                        
-                        _, _, best_data_idx = analyze_window(window)
+                        best_data_idx, nudge = decode_tracked_symbol(ring_buffer)
                         nibbles.append(best_data_idx)
                         current_nibble_count = len(nibbles)
 
@@ -228,14 +244,13 @@ def listen_for_ack_nak(timeout=4.0):
                                     return "NAK", target_seq
                             return None, None
                             
-                        samples_until_next_read += SYMBOL_SAMPLES
+                        samples_until_next_read += SYMBOL_SAMPLES + nudge
     except Exception:
         pass
     return None, None
 
 
 def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3):
-    # Split payload into fixed-size chunks (ensure at least 1 chunk even if empty)
     if len(data_payload) == 0:
         chunks = [b""]
     else:
@@ -260,16 +275,15 @@ def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3
         
         callback_status(f"Waiting for ACK/NAK on {pkt_label}...", "#f9e2af")
         print(f"Listening for response on {pkt_label}...")
-        time.sleep(0.3)
+        time.sleep(0.35)
         
-        response, resp_seq = listen_for_ack_nak(timeout=4.5)
+        response, resp_seq = listen_for_ack_nak(timeout=5.0)
         
         if response == "ACK" and resp_seq == seq_num:
             print(f"ACK received for {pkt_label}.")
             seq_num += 1
             retries_for_current_pkt = 0
         elif response == "NAK":
-            # Receiver explicitly specifies which packet sequence number to resend
             target = resp_seq if (resp_seq is not None and 0 <= resp_seq < total_packets) else seq_num
             retries_for_current_pkt += 1
             if retries_for_current_pkt >= max_retries:
@@ -304,9 +318,9 @@ class ReceiverThread(threading.Thread):
 
     def _send_control_response(self, stream, ring_buffer, seq_num, control_type):
         """Plays ACK/NAK, waits for room echo to settle, and flushes buffered audio."""
-        time.sleep(0.3)
+        time.sleep(0.4)
         play_audio_waveform(struct.pack('>H', seq_num), control_type)
-        time.sleep(0.15)
+        time.sleep(0.25)
         while stream.read_available > 0:
             stream.read(min(stream.read_available, STEP_SAMPLES))
         ring_buffer.fill(0)
@@ -324,7 +338,6 @@ class ReceiverThread(threading.Thread):
         is_image_packet = False
         current_seq_num = 0
         
-        # Multi-packet reassembly state
         expected_seq = 0
         reassembly_buffer = {}
         active_transfer_type = None
@@ -346,9 +359,9 @@ class ReceiverThread(threading.Thread):
                         detected_sync = []
                         last_snr = 0.0
                         for k in range(6):
-                            end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))
+                            end_offset = -((5 - k) * SYMBOL_SAMPLES + GUARD_OFFSET)
                             start_offset = end_offset - WINDOW_SAMPLES
-                            freq, snr, _ = analyze_window(ring_buffer[start_offset:end_offset])
+                            freq, snr, _, _ = analyze_window(ring_buffer[start_offset:end_offset])
                             detected_sync.append(freq)
                             if k == 5:
                                 last_snr = snr
@@ -382,11 +395,7 @@ class ReceiverThread(threading.Thread):
                     elif state == "RECEIVE_DATA":
                         samples_until_next_read -= STEP_SAMPLES
                         if samples_until_next_read <= 0:
-                            end_offset = -int(SAMPLE_RATE * 0.010)
-                            start_offset = end_offset - WINDOW_SAMPLES
-                            window = ring_buffer[start_offset:end_offset]
-                            
-                            _, _, best_data_idx = analyze_window(window)
+                            best_data_idx, nudge = decode_tracked_symbol(ring_buffer)
                             nibbles.append(best_data_idx)
                             current_nibble_count = len(nibbles)
 
@@ -395,12 +404,13 @@ class ReceiverThread(threading.Thread):
                                 length_bytes = decode_nibbles_to_bytes(nibbles[:4])
                                 payload_len = struct.unpack('>H', length_bytes)[0]
                                 expected_nibbles = (2 + payload_len + 4) * 2
-                                # Guard against corrupted length headers causing endless waits
-                                if payload_len < 5 or expected_nibbles > (2 + 5 + CHUNK_SIZE + 4) * 2:
-                                    self.callback_log(f"[ERROR] Corrupted length header! Requesting Packet {expected_seq + 1} (NAK)...\n")
-                                    self._send_control_response(stream, ring_buffer, expected_seq, TYPE_NAK)
-                                    state = "SEARCH_SYNC"
-                                    continue
+                                
+                                # If length header got corrupted, assume max chunk length so we wait
+                                # until the sender finishes transmitting before sending the NAK!
+                                max_allowed_nibbles = (2 + 5 + CHUNK_SIZE + 4) * 2
+                                if payload_len < 5 or expected_nibbles > max_allowed_nibbles:
+                                    self.callback_log("[WARN] Length header glitched; waiting for packet end to NAK...\n")
+                                    expected_nibbles = max_allowed_nibbles
 
                             # Nibbles 4..13: 5-byte header [1B Type | 2B SeqNum | 2B TotalPackets]
                             elif current_nibble_count == 14:
@@ -412,7 +422,7 @@ class ReceiverThread(threading.Thread):
                                     is_image_packet = True
                                 self.callback_log(f"  [Header] Type=0x{payload_type:02X}, Pkt {seq_num + 1}/{total_pkts} (unverified)...\n")
 
-                            # Nibbles 14 to (expected_nibbles - 9): Actual data payload (excludes 8-nibble CRC trailer)
+                            # Nibbles 14 to (expected_nibbles - 8): Data payload
                             elif (
                                 expected_nibbles is not None
                                 and 14 < current_nibble_count <= expected_nibbles - 8
@@ -436,7 +446,6 @@ class ReceiverThread(threading.Thread):
                                     p_type, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
                                     chunk_data = full_payload[5:]
                                     
-                                    # Reset state if a brand-new transfer starts at packet 0
                                     if seq_num == 0 and expected_seq != 0:
                                         reassembly_buffer.clear()
                                         expected_seq = 0
@@ -451,7 +460,6 @@ class ReceiverThread(threading.Thread):
                                         self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
                                         expected_seq += 1
 
-                                        # Check if all packets for this message/file have arrived
                                         if expected_seq == total_pkts:
                                             complete_data = b"".join(reassembly_buffer[i] for i in range(total_pkts))
                                             self.callback_packet_received(bytes([active_transfer_type]) + complete_data)
@@ -459,22 +467,19 @@ class ReceiverThread(threading.Thread):
                                             expected_seq = 0
                                             active_transfer_type = None
                                     elif seq_num < expected_seq:
-                                        # Duplicate packet (our previous ACK was likely missed by sender)
                                         self.callback_log(f"[INFO] Duplicate Packet {seq_num + 1}/{total_pkts}. Re-sending ACK...\n")
                                         self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
                                     else:
-                                        # Out-of-order packet received; request the missing expected_seq
                                         self.callback_log(f"[WARN] Out-of-order Packet {seq_num + 1}. Requesting Packet {expected_seq + 1} (NAK)...\n")
                                         self._send_control_response(stream, ring_buffer, expected_seq, TYPE_NAK)
                                 else:
-                                    # CRC Mismatch: Request exact missing sequence number via NAK
                                     self.callback_log(f"[ERROR] CRC Mismatch! Requesting Packet {expected_seq + 1} resend (NAK)...\n")
                                     self._send_control_response(stream, ring_buffer, expected_seq, TYPE_NAK)
                                     
                                 state = "SEARCH_SYNC"
                                 continue
                                 
-                            samples_until_next_read += SYMBOL_SAMPLES
+                            samples_until_next_read += SYMBOL_SAMPLES + nudge
         except Exception as e:
             self.callback_log(f"[INFO] Receiver stream stopped: {e}\n")
 
