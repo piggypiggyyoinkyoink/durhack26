@@ -14,13 +14,13 @@ from PIL import Image
 # MODEM CONFIGURATION & CONSTANTS
 # ============================================================================
 SAMPLE_RATE = 44100
-SYMBOL_DURATION = 0.100  # 100 ms total per symbol
-TONE_DURATION = 0.080    # 80 ms tone + 20 ms guard silence
+SYMBOL_DURATION = 0.060  # 60 ms total per symbol (faster & snappier)
+TONE_DURATION = 0.050    # 50 ms tone + 10 ms guard silence
 SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
-WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)  # 60ms analysis window
+WINDOW_SAMPLES = int(SAMPLE_RATE * 0.040)  # 40ms analysis window
 STEP_SAMPLES = int(SAMPLE_RATE * 0.010)    # 10ms step during sync search
 
-CHUNK_SIZE = 16  # Bytes per chunk
+CHUNK_SIZE = 32  # 32 bytes per chunk (16x16 image = 4 chunks total)
 
 # Payload Type Identifiers
 TYPE_TEXT = 0x01
@@ -64,7 +64,7 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     total_samples = int(sample_rate * total_slot_duration)
     
     t = np.linspace(0, duration, tone_samples, endpoint=False)
-    fade_len = int(sample_rate * 0.005)
+    fade_len = int(sample_rate * 0.003)
     
     envelope = np.ones(tone_samples)
     envelope[:fade_len] = np.linspace(0, 1, fade_len)
@@ -109,10 +109,10 @@ def play_audio_waveform(packet_bytes):
         freq = DATA_FREQS[nibble_val]
         waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
         
-    waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
+    waves.append(np.zeros(int(SAMPLE_RATE * 0.100), dtype=np.float32))
     full_signal = np.concatenate(waves).astype(np.float32)
     
-    time.sleep(0.3)  # Warmup pause for receiver input stream
+    time.sleep(0.25)  # Warmup pause for receiver input stream
     sd.play(full_signal, samplerate=SAMPLE_RATE)
     sd.wait()
 
@@ -168,13 +168,13 @@ def transmit_payload_selective_arq(payload_bytes, payload_type, callback_status,
             except Exception as e:
                 callback_status(f"Transmission error: {e}", "#f38ba8")
                 return False
-            time.sleep(0.12)  # brief inter-chunk pause
+            time.sleep(0.10)  # brief inter-chunk pause
             
         # 2. Listen for audit response (ACK or NAK with missing chunk list)
         callback_status("Listening for audit response...", "#f9e2af")
         print("Listening for receiver audit response...")
         
-        response_data = listen_for_audit_response(timeout=5.0)
+        response_data = listen_for_audit_response(timeout=6.0)
         
         if response_data == "ACK":
             callback_status("Transmission SUCCESS! All chunks verified.", "#a6e3a1")
@@ -192,7 +192,7 @@ def transmit_payload_selective_arq(payload_bytes, payload_type, callback_status,
     return False
 
 
-def listen_for_audit_response(timeout=5.0):
+def listen_for_audit_response(timeout=6.0):
     start_time = time.time()
     ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
     state = "SEARCH_SYNC"
@@ -316,23 +316,30 @@ class ReceiverThread(threading.Thread):
                     ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
                     ring_buffer[-STEP_SAMPLES:] = new_samples
                     
-                    # Check if burst silence timeout has passed and we have collected some chunks
-                    if total_chunks_expected is not None and len(active_chunks) > 0:
-                        if time.time() - last_packet_time > 1.8:
+                    # 1. Immediate completion check: If all chunks are received, ACK instantly without waiting for timeout
+                    if total_chunks_expected is not None and len(active_chunks) == total_chunks_expected:
+                        time.sleep(0.3)
+                        self.callback_log("[AUDIT] All chunks present and verified! Sending ACK.\n")
+                        play_audio_waveform(build_ack_packet())
+                        
+                        complete_data = b"".join(active_chunks[i] for i in range(total_chunks_expected))
+                        full_payload = bytes([payload_type_active]) + complete_data
+                        self.callback_packet_fully_received(full_payload)
+                        
+                        active_chunks.clear()
+                        total_chunks_expected = None
+                        payload_type_active = None
+                        last_packet_time = 0
+
+                    # 2. Silence timeout check: If burst has paused and chunks are missing, send NAK for missing ones
+                    elif total_chunks_expected is not None and len(active_chunks) > 0:
+                        if time.time() - last_packet_time > 6.0:
                             missing_indices = set(range(total_chunks_expected)) - set(active_chunks.keys())
                             
                             time.sleep(0.3)
-                            if not missing_indices:
-                                self.callback_log("[AUDIT] All chunks verified successfully! Sending ACK.\n")
-                                play_audio_waveform(build_ack_packet())
-                                
-                                complete_data = b"".join(active_chunks[i] for i in range(total_chunks_expected))
-                                full_payload = bytes([payload_type_active]) + complete_data
-                                self.callback_packet_fully_received(full_payload)
-                            else:
-                                self.callback_log(f"[AUDIT] Missing chunks: {sorted(list(missing_indices))}. Sending NAK.\n")
-                                play_audio_waveform(build_nak_packet(missing_indices))
-                                
+                            self.callback_log(f"[AUDIT] Timeout reached. Missing chunks: {sorted(list(missing_indices))}. Sending NAK.\n")
+                            play_audio_waveform(build_nak_packet(missing_indices))
+                            
                             active_chunks.clear()
                             total_chunks_expected = None
                             payload_type_active = None
