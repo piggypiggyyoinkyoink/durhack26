@@ -201,7 +201,7 @@ def listen(args):
     print(f"Listening at {sr} Hz  (0 = {args.f0:.0f} Hz, 1 = {args.f1:.0f} Hz, "
           f"{args.bit_duration * 1000:.0f} ms/bit). Ctrl+C to stop.")
 
-    with sd.InputStream(samplerate=sr, channels=1, blocksize=block_size,
+    with sd.InputStream(samplerate=sr, channels=2, blocksize=block_size,
                         dtype="float32", device=args.device, callback=callback):
         try:
             while True:
