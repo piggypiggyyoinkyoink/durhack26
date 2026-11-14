@@ -126,6 +126,57 @@ def save_transmission(data, out_dir):
     return path
 
 
+def select_loudest_device(sample_rate=44100, duration=3.0):
+    """
+    Open every input device at once for `duration` seconds and return the ID of the
+    one that picked up the highest peak amplitude (or None if none could be opened).
+
+    Run this while the transmitter is playing (or while there is some sound) so the
+    device that actually hears the signal wins.
+    """
+    peaks = {}      # device id -> highest absolute sample seen
+    streams = {}    # device id -> open stream
+
+    def make_callback(dev_id):
+        def callback(indata, frames, time_info, status):
+            peaks[dev_id] = max(peaks[dev_id], float(np.max(np.abs(indata))))
+        return callback
+
+    for dev_id, info in enumerate(sd.query_devices()):
+        if info["max_input_channels"] < 1:
+            continue
+        peaks[dev_id] = 0.0
+        try:
+            stream = sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32",
+                                    device=dev_id, callback=make_callback(dev_id))
+            stream.start()
+            streams[dev_id] = stream
+        except Exception as e:
+            print(f"  skipping device {dev_id} ({info['name']}): {e}")
+            del peaks[dev_id]
+
+    if not streams:
+        return None
+
+    print(f"Measuring {len(streams)} input device(s) for {duration:.0f} s...")
+    time.sleep(duration)
+
+    for stream in streams.values():
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+
+    names = {i: d["name"] for i, d in enumerate(sd.query_devices())}
+    for dev_id, peak in sorted(peaks.items(), key=lambda kv: kv[1], reverse=True):
+        print(f"  device {dev_id:>3}  peak {peak:.4f}  {names[dev_id]}")
+
+    best = max(peaks, key=peaks.get)
+    print(f"Selected device {best}: {names[best]}")
+    return best
+
+
 def listen(args):
     sr = args.sample_rate
     block_size = int(sr * 0.01)  # 10 ms blocks
@@ -197,24 +248,32 @@ def listen(args):
 def main():
     parser = argparse.ArgumentParser(description="Continuous FSK audio decoder")
     parser.add_argument("--list-devices", action="store_true", help="list audio devices and exit")
-    parser.add_argument("--device", default="1", help="input device index or name")
+    parser.add_argument("--device", default="auto",
+                        help="input device index or name, or 'auto' to pick the loudest device")
+    parser.add_argument("--auto-seconds", type=float, default=3.0,
+                        help="how long to measure each device when --device auto")
     parser.add_argument("--out-dir", default="received", help="folder for decoded files")
     parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--f0", type=float, default=12000.0, help="frequency for bit 0")
     parser.add_argument("--f1", type=float, default=13000.0, help="frequency for bit 1")
     parser.add_argument("--bit-duration", type=float, default=0.1, help="seconds per bit")
-    parser.add_argument("--min-rms", type=float, default=0.05,
+    parser.add_argument("--min-rms", type=float, default=0.005,
                         help="minimum block loudness to count as signal (raise in noisy rooms)")
     parser.add_argument("--min-tone-fraction", type=float, default=0.4,
                         help="fraction of block power that must sit at the two tones")
-    parser.add_argument("--silence-timeout", type=float, default=0.8,
+    parser.add_argument("--silence-timeout", type=float, default=0.5,
                         help="seconds without tones that ends a transmission")
     args = parser.parse_args()
 
     if args.list_devices:
         print(sd.query_devices())
         return
-    if isinstance(args.device, str) and args.device.isdigit():
+    if isinstance(args.device, str) and args.device.lower() == "auto":
+        args.device = select_loudest_device(args.sample_rate, args.auto_seconds)
+        if args.device is None:
+            print("No input device could be opened.")
+            return
+    elif isinstance(args.device, str) and args.device.isdigit():
         args.device = int(args.device)
 
     listen(args)
