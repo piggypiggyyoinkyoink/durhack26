@@ -261,7 +261,7 @@ def main():
                         help="minimum block loudness to count as signal (raise in noisy rooms)")
     parser.add_argument("--min-tone-fraction", type=float, default=0.4,
                         help="fraction of block power that must sit at the two tones")
-    parser.add_argument("--silence-timeout", type=float, default=0.5,
+    parser.add_argument("--silence-timeout", type=float, default=0.9,
                         help="seconds without tones that ends a transmission")
     args = parser.parse_args()
 
