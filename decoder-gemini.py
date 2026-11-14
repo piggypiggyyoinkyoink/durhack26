@@ -207,7 +207,7 @@ def listen(args):
 def main():
     parser = argparse.ArgumentParser(description="Framed FSK audio decoder")
     parser.add_argument("--list-devices", action="store_true")
-    parser.add_argument("--device", default="3")
+    parser.add_argument("--device", default="0")
     parser.add_argument("--out-dir", default="received")
     parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--f0", type=float, default=5000.0)
