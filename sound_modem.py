@@ -299,6 +299,15 @@ class ReceiverThread(threading.Thread):
         self.callback_log = callback_log
         self.running = False
 
+    def _send_control_response(self, stream, ring_buffer, seq_num, control_type):
+        """Plays ACK/NAK, waits for room echo to settle, and flushes buffered audio."""
+        time.sleep(0.3)
+        play_audio_waveform(struct.pack('>H', seq_num), control_type)
+        time.sleep(0.15)
+        while stream.read_available > 0:
+            stream.read(min(stream.read_available, STEP_SAMPLES))
+        ring_buffer.fill(0)
+
     def run(self):
         self.running = True
         self.callback_log("[INFO] Receiver listening for acoustic transmission...\n")
@@ -384,12 +393,10 @@ class ReceiverThread(threading.Thread):
                                 payload_len = struct.unpack('>H', length_bytes)[0]
                                 expected_nibbles = (2 + payload_len + 4) * 2
                                 # Guard against corrupted length headers causing endless waits
-                                if expected_nibbles > (2 + 5 + CHUNK_SIZE + 4) * 2:
+                                if payload_len < 5 or expected_nibbles > (2 + 5 + CHUNK_SIZE + 4) * 2:
                                     self.callback_log(f"[ERROR] Corrupted length header! Requesting Packet {expected_seq + 1} (NAK)...\n")
-                                    time.sleep(0.3)
-                                    play_audio_waveform(struct.pack('>H', expected_seq), TYPE_NAK)
+                                    self._send_control_response(stream, ring_buffer, expected_seq, TYPE_NAK)
                                     state = "SEARCH_SYNC"
-                                    ring_buffer.fill(0)
                                     continue
 
                             # Nibbles 4..13: 5-byte header [1B Type | 2B SeqNum | 2B TotalPackets]
@@ -398,16 +405,16 @@ class ReceiverThread(threading.Thread):
                                 payload_type, seq_num, total_pkts = struct.unpack('>BHH', header_bytes)
                                 current_seq_num = seq_num if seq_num < total_pkts else expected_seq
                                 
-                                if payload_type == TYPE_IMAGE:
+                                if payload_type == TYPE_IMAGE or active_transfer_type == TYPE_IMAGE:
                                     is_image_packet = True
-                                    self.callback_log(f"  Receiving Image Packet {current_seq_num + 1}/{total_pkts}...\n")
-                                elif payload_type == TYPE_TEXT:
-                                    self.callback_log(f"  Receiving Text Packet {current_seq_num + 1}/{total_pkts}...\n")
-                                else:
-                                    self.callback_log(f"  Receiving File Packet {current_seq_num + 1}/{total_pkts}...\n")
+                                self.callback_log(f"  [Header] Type=0x{payload_type:02X}, Pkt {seq_num + 1}/{total_pkts} (unverified)...\n")
 
-                            # Nibbles 14+: Data payload
-                            elif current_nibble_count > 14 and is_image_packet:
+                            # Nibbles 14 to (expected_nibbles - 9): Actual data payload (excludes 8-nibble CRC trailer)
+                            elif (
+                                expected_nibbles is not None
+                                and 14 < current_nibble_count <= expected_nibbles - 8
+                                and is_image_packet
+                            ):
                                 nibble_in_chunk = current_nibble_count - 15
                                 pixel_idx = (current_seq_num * CHUNK_SIZE * 2) + nibble_in_chunk
                                 if pixel_idx < 256:
@@ -420,6 +427,7 @@ class ReceiverThread(threading.Thread):
                                 full_payload = raw_bytes[2:-4]
                                 received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
                                 calculated_crc = zlib.crc32(full_payload) & 0xFFFFFFFF
+                                print(f"  Received {len(full_payload)} bytes, CRC: {received_crc:08X}, Calculated CRC: {calculated_crc:08X}")
                                 
                                 if received_crc == calculated_crc and len(full_payload) >= 5:
                                     p_type, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
@@ -437,8 +445,7 @@ class ReceiverThread(threading.Thread):
                                     if seq_num == expected_seq:
                                         reassembly_buffer[seq_num] = chunk_data
                                         self.callback_log(f"[SUCCESS] Packet {seq_num + 1}/{total_pkts} CRC Valid! Sending ACK...\n")
-                                        time.sleep(0.3)
-                                        play_audio_waveform(struct.pack('>H', seq_num), TYPE_ACK)
+                                        self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
                                         expected_seq += 1
 
                                         # Check if all packets for this message/file have arrived
@@ -451,21 +458,18 @@ class ReceiverThread(threading.Thread):
                                     elif seq_num < expected_seq:
                                         # Duplicate packet (our previous ACK was likely missed by sender)
                                         self.callback_log(f"[INFO] Duplicate Packet {seq_num + 1}/{total_pkts}. Re-sending ACK...\n")
-                                        time.sleep(0.3)
-                                        play_audio_waveform(struct.pack('>H', seq_num), TYPE_ACK)
+                                        self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
                                     else:
                                         # Out-of-order packet received; request the missing expected_seq
                                         self.callback_log(f"[WARN] Out-of-order Packet {seq_num + 1}. Requesting Packet {expected_seq + 1} (NAK)...\n")
-                                        time.sleep(0.3)
-                                        play_audio_waveform(struct.pack('>H', expected_seq), TYPE_NAK)
+                                        self._send_control_response(stream, ring_buffer, expected_seq, TYPE_NAK)
                                 else:
                                     # CRC Mismatch: Request exact missing sequence number via NAK
                                     self.callback_log(f"[ERROR] CRC Mismatch! Requesting Packet {expected_seq + 1} resend (NAK)...\n")
-                                    time.sleep(0.3)
-                                    play_audio_waveform(struct.pack('>H', expected_seq), TYPE_NAK)
+                                    self._send_control_response(stream, ring_buffer, expected_seq, TYPE_NAK)
                                     
                                 state = "SEARCH_SYNC"
-                                ring_buffer.fill(0)
+                                continue
                                 
                             samples_until_next_read += SYMBOL_SAMPLES
         except Exception as e:
