@@ -14,11 +14,11 @@ from PIL import Image
 # MODEM CONFIGURATION & CONSTANTS
 # ============================================================================
 SAMPLE_RATE = 44100
-SYMBOL_DURATION = 0.100  # 100 ms total per symbol
-TONE_DURATION = 0.080    # 80 ms tone + 20 ms guard silence
+SYMBOL_DURATION = 0.020  # 100 ms total per symbol
+TONE_DURATION = 0.016    # 80 ms tone + 20 ms guard silence
 SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
-WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)  # 60ms analysis window
-STEP_SAMPLES = int(SAMPLE_RATE * 0.010)    # 10ms step during sync search
+WINDOW_SAMPLES = int(SAMPLE_RATE * 0.012)  # 60ms analysis window
+STEP_SAMPLES = int(SAMPLE_RATE * 0.002)    # 10ms step during sync search
 
 CHUNK_SIZE = 32  # Bytes per packet chunk (32 bytes = 6.4s audio per chunk)
 
