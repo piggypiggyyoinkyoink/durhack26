@@ -170,7 +170,7 @@ def transmit_image_selective_arq(pixel_bytes, callback_status, max_retries=5):
             except Exception as e:
                 callback_status(f"Audio transmission error: {e}", "#f38ba8")
                 return False
-            time.sleep(0.15) # brief inter-chunk pause
+            time.sleep(0.15)  brief inter-chunk pause
             
         # 2. Listen for receiver feedback response (ACK or NAK with list of failed chunks)
         callback_status("Listening for selective chunk audit response...", "#f9e2af")
