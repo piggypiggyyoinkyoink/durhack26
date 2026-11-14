@@ -1,5 +1,5 @@
-FREQUENCY_0 = 3000.0
-FREQUENCY_1 = 4000.0
+FREQUENCY_0 = 12000.0
+FREQUENCY_1 = 13000.0
 PULSE_DURATION = 0.25
 
 """Record the tones produced by binary_audio_enc.py and reconstruct the file."""
