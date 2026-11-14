@@ -20,11 +20,11 @@ SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
 WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)  # 60ms analysis window
 STEP_SAMPLES = int(SAMPLE_RATE * 0.010)    # 10ms step during sync search
 
-CHUNK_SIZE = 16  # Bytes per chunk (16x16 image = 128 bytes total = 8 chunks)
+CHUNK_SIZE = 16  # Bytes per chunk
 
 # Payload Type Identifiers
-TYPE_IMAGE = 0x02
 TYPE_TEXT = 0x01
+TYPE_IMAGE = 0x02
 TYPE_FILE = 0x03
 TYPE_ACK = 0x04
 TYPE_NAK = 0x05
@@ -83,16 +83,15 @@ def build_chunk_packet(chunk_idx, total_chunks, payload_type, chunk_data):
     packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
     return packet
 
-def build_selective_nak_packet(failed_indices):
-    # NAK packet payload: [TYPE_NAK (1B)] + [Num Failed (1B)] + [Failed Index 1, Index 2, ...]
-    fail_bytes = bytes([len(failed_indices)] + list(failed_indices))
-    full_payload = bytes([TYPE_NAK]) + fail_bytes
+def build_ack_packet():
+    full_payload = bytes([TYPE_ACK])
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
     packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
     return packet
 
-def build_ack_packet():
-    full_payload = bytes([TYPE_ACK])
+def build_nak_packet(missing_indices):
+    fail_bytes = bytes([len(missing_indices)] + sorted(list(missing_indices)))
+    full_payload = bytes([TYPE_NAK]) + fail_bytes
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
     packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
     return packet
@@ -113,7 +112,7 @@ def play_audio_waveform(packet_bytes):
     waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
     full_signal = np.concatenate(waves).astype(np.float32)
     
-    time.sleep(0.3)
+    time.sleep(0.3)  # Warmup pause for receiver input stream
     sd.play(full_signal, samplerate=SAMPLE_RATE)
     sd.wait()
 
@@ -146,12 +145,11 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes(byte_list)
 
 
-def transmit_image_selective_arq(pixel_bytes, callback_status, max_retries=5):
-    """Sends full image burst, listens for selective NAK list, resends only missing chunks."""
-    chunks = [pixel_bytes[i:i + CHUNK_SIZE] for i in range(0, len(pixel_bytes), CHUNK_SIZE)]
+def transmit_payload_selective_arq(payload_bytes, payload_type, callback_status, max_retries=5):
+    """Transmits full payload as a burst, listens for NAK audit response, and resends only missing chunks."""
+    chunks = [payload_bytes[i:i + CHUNK_SIZE] for i in range(0, len(payload_bytes), CHUNK_SIZE)]
     total_chunks = len(chunks)
     
-    # Track which chunks still need to be sent
     pending_indices = set(range(total_chunks))
     
     for attempt in range(1, max_retries + 1):
@@ -161,33 +159,33 @@ def transmit_image_selective_arq(pixel_bytes, callback_status, max_retries=5):
         callback_status(f"Burst Transmitting {len(pending_indices)} chunk(s) (Attempt {attempt})...", "#89b4fa")
         print(f"\n--- Burst Transmission Attempt {attempt} for chunks: {sorted(list(pending_indices))} ---")
         
-        # 1. Send all pending chunks in sequence
+        # 1. Send all pending chunks in rapid sequence
         for idx in sorted(list(pending_indices)):
-            packet = build_chunk_packet(idx, total_chunks, TYPE_IMAGE, chunks[idx])
+            packet = build_chunk_packet(idx, total_chunks, payload_type, chunks[idx])
             print(f"  Sending Chunk {idx + 1}/{total_chunks}...")
             try:
                 play_audio_waveform(packet)
             except Exception as e:
-                callback_status(f"Audio transmission error: {e}", "#f38ba8")
+                callback_status(f"Transmission error: {e}", "#f38ba8")
                 return False
-            time.sleep(0.15)  brief inter-chunk pause
+            time.sleep(0.12)  # brief inter-chunk pause
             
-        # 2. Listen for receiver feedback response (ACK or NAK with list of failed chunks)
-        callback_status("Listening for selective chunk audit response...", "#f9e2af")
+        # 2. Listen for audit response (ACK or NAK with missing chunk list)
+        callback_status("Listening for audit response...", "#f9e2af")
         print("Listening for receiver audit response...")
         
         response_data = listen_for_audit_response(timeout=5.0)
         
         if response_data == "ACK":
-            callback_status("Image Transmission SUCCESS! All chunks verified.", "#a6e3a1")
-            print("Full image acknowledged successfully (ACK).")
+            callback_status("Transmission SUCCESS! All chunks verified.", "#a6e3a1")
+            print("Payload successfully acknowledged (ACK).")
             return True
         elif isinstance(response_data, set):
             pending_indices = response_data
-            callback_status(f"CRC Mismatch. Resending {len(pending_indices)} failed chunk(s)...", "#fab387")
+            callback_status(f"CRC Mismatch. Resending {len(pending_indices)} missing chunk(s)...", "#fab387")
             print(f"Receiver requested retransmission for chunks: {sorted(list(pending_indices))}")
         else:
-            callback_status("No response heard. Resending all pending...", "#fab387")
+            callback_status("No response heard. Retrying pending chunks...", "#fab387")
             print("Audit response timeout. Retrying pending chunks...")
             
     callback_status("Transmission FAILED after max retries.", "#f38ba8")
@@ -292,7 +290,7 @@ class ReceiverThread(threading.Thread):
 
     def run(self):
         self.running = True
-        self.callback_log("[INFO] Receiver listening for image burst...\n")
+        self.callback_log("[INFO] Receiver listening for burst transmission...\n")
         
         ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
         state = "SEARCH_SYNC"
@@ -303,9 +301,11 @@ class ReceiverThread(threading.Thread):
         sync_armed = False
         best_sync_snr = 0.0
 
-        # Session buffer for incoming image burst
-        active_image_chunks = {}
-        total_image_chunks_expected = 8  # 128 bytes / 16 bytes per chunk
+        # Burst assembly state
+        active_chunks = {}
+        total_chunks_expected = None
+        payload_type_active = None
+        last_packet_time = 0
 
         try:
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
@@ -316,6 +316,28 @@ class ReceiverThread(threading.Thread):
                     ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
                     ring_buffer[-STEP_SAMPLES:] = new_samples
                     
+                    # Check if burst silence timeout has passed and we have collected some chunks
+                    if total_chunks_expected is not None and len(active_chunks) > 0:
+                        if time.time() - last_packet_time > 1.8:
+                            missing_indices = set(range(total_chunks_expected)) - set(active_chunks.keys())
+                            
+                            time.sleep(0.3)
+                            if not missing_indices:
+                                self.callback_log("[AUDIT] All chunks verified successfully! Sending ACK.\n")
+                                play_audio_waveform(build_ack_packet())
+                                
+                                complete_data = b"".join(active_chunks[i] for i in range(total_chunks_expected))
+                                full_payload = bytes([payload_type_active]) + complete_data
+                                self.callback_packet_fully_received(full_payload)
+                            else:
+                                self.callback_log(f"[AUDIT] Missing chunks: {sorted(list(missing_indices))}. Sending NAK.\n")
+                                play_audio_waveform(build_nak_packet(missing_indices))
+                                
+                            active_chunks.clear()
+                            total_chunks_expected = None
+                            payload_type_active = None
+                            last_packet_time = 0
+
                     if state == "SEARCH_SYNC":
                         detected_sync = []
                         last_snr = 0.0
@@ -332,7 +354,7 @@ class ReceiverThread(threading.Thread):
                                 best_sync_snr = last_snr
                                 sync_armed = True
                             elif sync_armed:
-                                self.callback_log("\n[SYNC LOCKED] Receiving image chunk...\n")
+                                self.callback_log("\n[SYNC LOCKED] Receiving chunk...\n")
                                 state = "RECEIVE_DATA"
                                 nibbles = []
                                 expected_nibbles = None
@@ -340,7 +362,7 @@ class ReceiverThread(threading.Thread):
                                 best_sync_snr = 0.0
                                 samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
                         elif sync_armed:
-                            self.callback_log("\n[SYNC LOCKED] Receiving image chunk...\n")
+                            self.callback_log("\n[SYNC LOCKED] Receiving chunk...\n")
                             state = "RECEIVE_DATA"
                             nibbles = []
                             expected_nibbles = None
@@ -374,46 +396,34 @@ class ReceiverThread(threading.Thread):
                                     total_chunks = full_payload[1]
                                     payload_type = full_payload[2]
                                     chunk_data = full_payload[3:]
-                                    total_image_chunks_expected = total_chunks
                                     
-                                    self.callback_log(f"  [CRC OK] Chunk {chunk_idx + 1}/{total_chunks} received cleanly.\n")
-                                    active_image_chunks[chunk_idx] = chunk_data
+                                    total_chunks_expected = total_chunks
+                                    payload_type_active = payload_type
+                                    active_chunks[chunk_idx] = chunk_data
+                                    last_packet_time = time.time()
                                     
-                                    # Update live pixel feed immediately
-                                    base_pixel_idx = chunk_idx * CHUNK_SIZE * 2
-                                    for p_offset in range(len(chunk_data) * 2):
-                                        byte_idx = p_offset // 2
-                                        is_high_nibble = (p_offset % 2 == 0)
-                                        b_val = chunk_data[byte_idx]
-                                        color_idx = (b_val >> 4) if is_high_nibble else (b_val & 0x0F)
-                                        
-                                        abs_pixel_idx = base_pixel_idx + p_offset
-                                        if abs_pixel_idx < 256:
-                                            r = abs_pixel_idx // 16
-                                            c = abs_pixel_idx % 16
-                                            self.callback_pixel_received(r, c, color_idx)
+                                    self.callback_log(f"  [CRC OK] Chunk {chunk_idx + 1}/{total_chunks} received (Type {payload_type}).\n")
+                                    
+                                    # If image, update live pixel feed immediately
+                                    if payload_type == TYPE_IMAGE:
+                                        base_pixel_idx = chunk_idx * CHUNK_SIZE * 2
+                                        for p_offset in range(len(chunk_data) * 2):
+                                            byte_idx = p_offset // 2
+                                            is_high_nibble = (p_offset % 2 == 0)
+                                            b_val = chunk_data[byte_idx]
+                                            color_idx = (b_val >> 4) if is_high_nibble else (b_val & 0x0F)
+                                            
+                                            abs_pixel_idx = base_pixel_idx + p_offset
+                                            if abs_pixel_idx < 256:
+                                                r = abs_pixel_idx // 16
+                                                c = abs_pixel_idx % 16
+                                                self.callback_pixel_received(r, c, color_idx)
                                 else:
                                     self.callback_log(f"  [CRC ERROR] A chunk failed verification.\n")
                                     
                                 state = "SEARCH_SYNC"
                                 ring_buffer.fill(0)
                                 
-                                # Check if we have collected all chunks for the image burst
-                                if len(active_image_chunks) == total_image_chunks_expected:
-                                    complete_pixel_bytes = b"".join(active_image_chunks[i] for i in range(total_image_chunks_expected))
-                                    full_payload = bytes([TYPE_IMAGE]) + complete_pixel_bytes
-                                    self.callback_packet_fully_received(full_payload)
-                                    
-                                    self.callback_log("[AUDIT] All chunks present and verified! Sending ACK.\n")
-                                    time.sleep(0.4)
-                                    play_audio_waveform(build_ack_packet())
-                                    active_image_chunks.clear()
-                                else:
-                                    # If burst pause is detected or if we want to audit missing chunks after a short silence window
-                                    # For simplicity, if we receive packets, we can also let sender know if we have missing ones. 
-                                    # Here, the receiver can send a NAK listing missing chunks if transmission pause occurs:
-                                    pass
-                                    
                             samples_until_next_read += SYMBOL_SAMPLES
         except Exception as e:
             self.callback_log(f"[INFO] Receiver stream stopped: {e}\n")
@@ -428,7 +438,7 @@ class ReceiverThread(threading.Thread):
 class SoundModemApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Acoustic 16x16 Image Transceiver with Selective Repeat ARQ")
+        self.title("Acoustic Data & Image Transceiver with Selective ARQ")
         self.geometry("900x680")
         self.configure(bg="#1e1e2e")
         self.resizable(False, False)
@@ -459,7 +469,7 @@ class HomePage(tk.Frame):
         title = tk.Label(self, text="SONIC MODEM", font=("Helvetica", 32, "bold"), fg="#cdd6f4", bg="#1e1e2e")
         title.pack(pady=(120, 10))
 
-        subtitle = tk.Label(self, text="Selective Repeat ARQ Image Transceiver", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
+        subtitle = tk.Label(self, text="Selective Repeat ARQ Acoustic Transceiver", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
         subtitle.pack(pady=(0, 60))
 
         btn_frame = tk.Frame(self, bg="#1e1e2e")
@@ -494,7 +504,7 @@ class SendPage(tk.Frame):
             bg="#313244", fg="#11111b", highlightbackground="#181825",
             command=lambda: controller.show_frame("HomePage")
         ).pack(side="left", padx=15, pady=10)
-        tk.Label(nav, text="TRANSMIT 16x16 IMAGE BURST", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
+        tk.Label(nav, text="TRANSMIT DATA / IMAGE WITH SELECTIVE ARQ", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
 
         style = ttk.Style()
         style.theme_use("default")
@@ -504,9 +514,16 @@ class SendPage(tk.Frame):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=20, pady=10)
 
+        self.tab_text = tk.Frame(self.notebook, bg="#181825")
+        self.tab_file = tk.Frame(self.notebook, bg="#181825")
         self.tab_editor = tk.Frame(self.notebook, bg="#181825")
-        self.notebook.add(self.tab_editor, text="   16x16 Pixel Editor   ")
 
+        self.notebook.add(self.tab_text, text="   1. Text Message   ")
+        self.notebook.add(self.tab_file, text="   2. Choose File   ")
+        self.notebook.add(self.tab_editor, text="   3. 16x16 Pixel Editor   ")
+
+        self._build_text_tab()
+        self._build_file_tab()
         self._build_editor_tab()
 
         bottom = tk.Frame(self, bg="#181825", height=70)
@@ -516,11 +533,73 @@ class SendPage(tk.Frame):
         self.status_lbl.pack(side="left", padx=20, pady=15)
 
         self.tx_btn = tk.Button(
-            bottom, text="🔊 TRANSMIT IMAGE BURST", font=("Helvetica", 13, "bold"),
+            bottom, text="🔊 TRANSMIT ACTIVE TAB", font=("Helvetica", 13, "bold"),
             bg="#f38ba8", fg="#11111b", highlightbackground="#181825",
             padx=20, pady=8, cursor="hand2", command=self.start_transmission
         )
         self.tx_btn.pack(side="right", padx=20, pady=10)
+
+    def _build_text_tab(self):
+        tk.Label(self.tab_text, text="Enter UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
+        self.text_input = tk.Text(self.tab_text, height=14, font=("Courier", 13), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4", relief="flat")
+        self.text_input.pack(fill="x", padx=20, pady=10)
+        self.text_input.insert("1.0", "Hello World! Testing acoustic modem with Selective ARQ.")
+
+    def _build_file_tab(self):
+        self.selected_file_path = None
+        self.raw_file_bytes = None
+
+        frame = tk.Frame(self.tab_file, bg="#181825")
+        frame.pack(expand=True)
+
+        tk.Button(
+            frame, text="📁 Browse Device for File...", font=("Helvetica", 14, "bold"),
+            bg="#89b4fa", fg="#11111b", highlightbackground="#181825",
+            padx=20, pady=10, cursor="hand2", command=self.choose_file
+        ).pack(pady=10)
+
+        self.file_info_lbl = tk.Label(frame, text="No file selected.", font=("Helvetica", 12), bg="#181825", fg="#a6adc8")
+        self.file_info_lbl.pack(pady=10)
+
+        self.convert_img_btn = tk.Button(
+            frame, text="🎨 Load Image into 16x16 Pixel Editor",
+            font=("Helvetica", 11, "bold"), bg="#cba6f7", fg="#11111b",
+            highlightbackground="#181825", padx=15, pady=6, state="disabled",
+            command=self.load_file_into_editor
+        )
+        self.convert_img_btn.pack(pady=10)
+
+    def choose_file(self):
+        path = filedialog.askopenfilename(title="Select a file to transmit")
+        if not path:
+            return
+        self.selected_file_path = path
+        with open(path, "rb") as f:
+            self.raw_file_bytes = f.read()
+
+        size_kb = len(self.raw_file_bytes) / 1024
+        self.file_info_lbl.config(text=f"Selected: {path.split('/')[-1]} ({len(self.raw_file_bytes)} bytes / {size_kb:.2f} KB)")
+        if path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif")):
+            self.convert_img_btn.config(state="normal")
+        else:
+            self.convert_img_btn.config(state="disabled")
+
+    def load_file_into_editor(self):
+        try:
+            img = Image.open(self.selected_file_path).convert("RGB")
+            img = img.resize((16, 16), Image.Resampling.NEAREST)
+            for r in range(16):
+                for c in range(16):
+                    rgb = img.getpixel((c, r))
+                    closest_idx = min(
+                        range(16),
+                        key=lambda i: sum((rgb[k] - PALETTE_RGB[i][k]) ** 2 for k in range(3))
+                    )
+                    self.set_grid_pixel(r, c, closest_idx)
+            self.notebook.select(self.tab_editor)
+            self.status_lbl.config(text="Converted image to 16x16 16-color canvas!")
+        except Exception as e:
+            messagebox.showerror("Image Error", f"Could not process image:\n{e}")
 
     def _build_editor_tab(self):
         self.grid_size = 16
@@ -639,9 +718,25 @@ class SendPage(tk.Frame):
         self.after(0, _set)
 
     def start_transmission(self):
-        payload = self.get_packed_canvas_bytes()
+        active_tab = self.notebook.index(self.notebook.select())
+        if active_tab == 0:
+            text = self.text_input.get("1.0", "end-1c").strip()
+            payload = text.encode("utf-8")
+            payload_type = TYPE_TEXT
+        elif active_tab == 1:
+            if not self.raw_file_bytes:
+                messagebox.showwarning("No File", "Please choose a file first.")
+                return
+            payload = self.raw_file_bytes
+            payload_type = TYPE_FILE
+        elif active_tab == 2:
+            payload = self.get_packed_canvas_bytes()
+            payload_type = TYPE_IMAGE
+        else:
+            return
+
         threading.Thread(
-            target=lambda: transmit_image_selective_arq(payload, self.update_status, max_retries=5),
+            target=lambda: transmit_payload_selective_arq(payload, payload_type, self.update_status, max_retries=5),
             daemon=True
         ).start()
 
@@ -661,7 +756,7 @@ class ReceivePage(tk.Frame):
             bg="#313244", fg="#11111b", highlightbackground="#181825",
             command=lambda: controller.show_frame("HomePage")
         ).pack(side="left", padx=15, pady=10)
-        tk.Label(nav, text="RECEIVER & LIVE 16x16 DECODER", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
+        tk.Label(nav, text="RECEIVER & LIVE DECODER", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
 
         main_body = tk.Frame(self, bg="#1e1e2e")
         main_body.pack(fill="both", expand=True, padx=25, pady=20)
@@ -752,7 +847,25 @@ class ReceivePage(tk.Frame):
 
     def on_packet_received(self, full_payload):
         def _handle():
-            self.append_log("[SUCCESS] 16x16 Image Burst fully received, audited, and verified!\n\n")
+            payload_type = full_payload[0]
+            actual_data = full_payload[1:]
+
+            if payload_type == TYPE_IMAGE:
+                self.append_log(f"[SUCCESS] 16x16 Image Burst fully received and verified!\n\n")
+            elif payload_type == TYPE_TEXT:
+                try:
+                    text_msg = actual_data.decode("utf-8")
+                    self.append_log(f"Decoded Message Burst:\n{text_msg}\n[SUCCESS] Verified.\n\n")
+                except UnicodeDecodeError:
+                    self.append_log(f"[ERROR] Text payload contained invalid UTF-8 bytes.\n")
+            elif payload_type == TYPE_FILE:
+                self.append_log(f"Received binary file burst ({len(actual_data)} bytes). Saving to ./received/\n")
+                os.makedirs("received", exist_ok=True)
+                filename = datetime.now().strftime("received_%Y%m%d_%H%M%S.bin")
+                filepath = os.path.join("received", filename)
+                with open(filepath, "wb") as f:
+                    f.write(actual_data)
+                self.append_log(f"Saved to {filepath}\n\n")
         self.after(0, _handle)
 
 
