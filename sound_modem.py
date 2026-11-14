@@ -11,7 +11,7 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image
 
 # ============================================================================
-# MODEM CONFIGURATION & CONSTANTS
+# MODEM CONFIGURATION & CONSTANTS (16x16 Grid)
 # ============================================================================
 SAMPLE_RATE = 44100
 SYMBOL_DURATION = 0.100  # 100 ms total per symbol
@@ -55,7 +55,7 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     total_samples = int(sample_rate * total_slot_duration)
     
     t = np.linspace(0, duration, tone_samples, endpoint=False)
-    fade_len = int(sample_rate * 0.005)  # 5 ms fade to eliminate clicks
+    fade_len = int(sample_rate * 0.005)
     
     envelope = np.ones(tone_samples)
     envelope[:fade_len] = np.linspace(0, 1, fade_len)
@@ -69,9 +69,8 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
 
 def build_packet(payload):
     if len(payload) > 65535:
-        raise ValueError("Payload too large for 2-byte length header (max 65535 bytes).")
+        raise ValueError("Payload too large for 2-byte length header.")
     crc = zlib.crc32(payload) & 0xFFFFFFFF
-    # Packet structure: [Length (2B)] + [Payload] + [CRC32 (4B)]
     packet = struct.pack('>H', len(payload)) + payload + struct.pack('>I', crc)
     return packet
 
@@ -81,18 +80,15 @@ def transmit_payload(payload):
         bitstring = "".join(f"{byte:08b}" for byte in packet)
         
         waves = []
-        # Preamble: 6 alternating sync tones
         preamble_freqs = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
         for freq in preamble_freqs:
             waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
             
-        # Data nibbles (4 bits per symbol)
         for i in range(0, len(bitstring), 4):
             nibble_val = int(bitstring[i:i+4], 2)
             freq = DATA_FREQS[nibble_val]
             waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
             
-        # Tail silence
         waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
         full_signal = np.concatenate(waves).astype(np.float32)
         
@@ -135,10 +131,11 @@ def decode_nibbles_to_bytes(nibbles):
 
 
 class ReceiverThread(threading.Thread):
-    def __init__(self, callback_packet_received, callback_log):
+    def __init__(self, callback_packet_received, callback_pixel_received, callback_log):
         super().__init__()
         self.daemon = True
         self.callback_packet_received = callback_packet_received
+        self.callback_pixel_received = callback_pixel_received
         self.callback_log = callback_log
         self.running = False
 
@@ -158,7 +155,7 @@ class ReceiverThread(threading.Thread):
         try:
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
                 while self.running:
-                    audio, overflow = stream.read(STEP_SAMPLES)
+                    audio, _ = stream.read(STEP_SAMPLES)
                     new_samples = audio[:, 0]
                     
                     ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
@@ -204,15 +201,22 @@ class ReceiverThread(threading.Thread):
                             
                             freq, snr, best_data_idx = analyze_window(window)
                             nibbles.append(best_data_idx)
+                            current_nibble_count = len(nibbles)
 
-                            # First 4 nibbles = 2 bytes payload length (>H)
-                            if len(nibbles) == 4:
+                            if current_nibble_count == 4:
                                 length_bytes = decode_nibbles_to_bytes(nibbles[:4])
                                 payload_len = struct.unpack('>H', length_bytes)[0]
                                 expected_nibbles = (2 + payload_len + 4) * 2
                                 self.callback_log(f"  Header decoded: expecting {payload_len} bytes...\n")
 
-                            if expected_nibbles is not None and len(nibbles) >= expected_nibbles:
+                            elif current_nibble_count > 4 and expected_nibbles and current_nibble_count <= 4 + 256:
+                                pixel_idx = current_nibble_count - 5
+                                if pixel_idx < 256:
+                                    r = pixel_idx // 16
+                                    c = pixel_idx % 16
+                                    self.callback_pixel_received(r, c, best_data_idx)
+
+                            if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
                                 raw_bytes = decode_nibbles_to_bytes(nibbles)
                                 payload = raw_bytes[2:-4]
                                 received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
@@ -241,7 +245,7 @@ class ReceiverThread(threading.Thread):
 class SoundModemApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Acoustic Data & Image Transceiver")
+        self.title("Acoustic Data & Image Transceiver (16x16)")
         self.geometry("900x680")
         self.configure(bg="#1e1e2e")
         self.resizable(False, False)
@@ -272,7 +276,7 @@ class HomePage(tk.Frame):
         title = tk.Label(self, text="SONIC MODEM", font=("Helvetica", 32, "bold"), fg="#cdd6f4", bg="#1e1e2e")
         title.pack(pady=(120, 10))
 
-        subtitle = tk.Label(self, text="Acoustic Text & 32x32 Pixel Art Transceiver", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
+        subtitle = tk.Label(self, text="Acoustic Text & 16x16 Pixel Art Transceiver", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
         subtitle.pack(pady=(0, 60))
 
         btn_frame = tk.Frame(self, bg="#1e1e2e")
@@ -307,7 +311,7 @@ class SendPage(tk.Frame):
             bg="#313244", fg="#11111b", highlightbackground="#181825",
             command=lambda: controller.show_frame("HomePage")
         ).pack(side="left", padx=15, pady=10)
-        tk.Label(nav, text="TRANSMIT DATA / IMAGE", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
+        tk.Label(nav, text="TRANSMIT DATA / 16x16 IMAGE", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
 
         style = ttk.Style()
         style.theme_use("default")
@@ -323,7 +327,7 @@ class SendPage(tk.Frame):
 
         self.notebook.add(self.tab_text, text="   1. Text Message   ")
         self.notebook.add(self.tab_file, text="   2. Choose File   ")
-        self.notebook.add(self.tab_editor, text="   3. 32x32 Pixel Editor   ")
+        self.notebook.add(self.tab_editor, text="   3. 16x16 Pixel Editor   ")
 
         self._build_text_tab()
         self._build_file_tab()
@@ -365,7 +369,7 @@ class SendPage(tk.Frame):
         self.file_info_lbl.pack(pady=10)
 
         self.convert_img_btn = tk.Button(
-            frame, text="🎨 Load Image into 32x32 Pixel Editor",
+            frame, text="🎨 Load Image into 16x16 Pixel Editor",
             font=("Helvetica", 11, "bold"), bg="#cba6f7", fg="#11111b",
             highlightbackground="#181825", padx=15, pady=6, state="disabled",
             command=self.load_file_into_editor
@@ -390,9 +394,9 @@ class SendPage(tk.Frame):
     def load_file_into_editor(self):
         try:
             img = Image.open(self.selected_file_path).convert("RGB")
-            img = img.resize((32, 32), Image.Resampling.NEAREST)
-            for r in range(32):
-                for c in range(32):
+            img = img.resize((16, 16), Image.Resampling.NEAREST)
+            for r in range(16):
+                for c in range(16):
                     rgb = img.getpixel((c, r))
                     closest_idx = min(
                         range(16),
@@ -400,16 +404,16 @@ class SendPage(tk.Frame):
                     )
                     self.set_grid_pixel(r, c, closest_idx)
             self.notebook.select(self.tab_editor)
-            self.status_lbl.config(text="Converted image to 32x32 16-color canvas!")
+            self.status_lbl.config(text="Converted image to 16x16 16-color canvas!")
         except Exception as e:
             messagebox.showerror("Image Error", f"Could not process image:\n{e}")
 
     def _build_editor_tab(self):
-        self.grid_size = 32
-        self.cell_size = 13
+        self.grid_size = 16
+        self.cell_size = 24
         self.current_color_idx = 8
-        self.pixel_data = [[0 for _ in range(32)] for _ in range(32)]
-        self.rect_ids = [[None for _ in range(32)] for _ in range(32)]
+        self.pixel_data = [[0 for _ in range(16)] for _ in range(16)]
+        self.rect_ids = [[None for _ in range(16)] for _ in range(16)]
 
         editor_container = tk.Frame(self.tab_editor, bg="#181825")
         editor_container.pack(expand=True, fill="both", padx=20, pady=10)
@@ -418,8 +422,8 @@ class SendPage(tk.Frame):
         self.canvas = tk.Canvas(editor_container, width=canvas_size, height=canvas_size, bg="#000000", highlightthickness=2, highlightbackground="#585b70")
         self.canvas.pack(side="left", padx=(20, 30), pady=5)
 
-        for r in range(32):
-            for c in range(32):
+        for r in range(16):
+            for c in range(16):
                 x1, y1 = c * self.cell_size, r * self.cell_size
                 x2, y2 = x1 + self.cell_size, y1 + self.cell_size
                 rect = self.canvas.create_rectangle(x1, y1, x2, y2, fill=PALETTE[0], outline="#1e1e2e", width=1)
@@ -451,6 +455,13 @@ class SendPage(tk.Frame):
         tk.Button(tools_frame, text="Fill Canvas with Selected", font=("Helvetica", 10, "bold"), highlightbackground="#181825", width=22, pady=5, cursor="hand2", command=self.fill_canvas).pack(pady=4)
         tk.Button(tools_frame, text="Clear Canvas (Black)", font=("Helvetica", 10, "bold"), highlightbackground="#181825", width=22, pady=5, cursor="hand2", command=lambda: self.fill_canvas(0)).pack(pady=4)
         tk.Button(tools_frame, text="Load Test Pattern", font=("Helvetica", 10, "bold"), highlightbackground="#181825", width=22, pady=5, cursor="hand2", command=self.load_test_pattern).pack(pady=4)
+        
+        # --- NEW: Save Image Button ---
+        tk.Button(
+            tools_frame, text="💾 Save Drawn Image (.png)", font=("Helvetica", 10, "bold"),
+            bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=22, pady=6, cursor="hand2",
+            command=self.save_drawn_image
+        ).pack(pady=(15, 4))
 
     def select_color(self, idx):
         self.current_color_idx = idx
@@ -459,7 +470,7 @@ class SendPage(tk.Frame):
         self.active_color_lbl.config(text=f"Selected: Color #{idx} ({PALETTE[idx]})")
 
     def set_grid_pixel(self, r, c, color_idx):
-        if 0 <= r < 32 and 0 <= c < 32:
+        if 0 <= r < 16 and 0 <= c < 16:
             self.pixel_data[r][c] = color_idx
             self.canvas.itemconfig(self.rect_ids[r][c], fill=PALETTE[color_idx])
 
@@ -475,17 +486,35 @@ class SendPage(tk.Frame):
 
     def fill_canvas(self, color_idx=None):
         idx = self.current_color_idx if color_idx is None else color_idx
-        for r in range(32):
-            for c in range(32):
+        for r in range(16):
+            for c in range(16):
                 self.set_grid_pixel(r, c, idx)
 
     def load_test_pattern(self):
-        for r in range(32):
-            for c in range(32):
-                self.set_grid_pixel(r, c, ((r // 8) * 4 + (c // 8)) % 16)
+        for r in range(16):
+            for c in range(16):
+                self.set_grid_pixel(r, c, ((r // 4) * 4 + (c // 4)) % 16)
+
+    def save_drawn_image(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png"), ("All files", "*.*")])
+        if not file_path:
+            return
+        try:
+            img = Image.new("RGB", (16, 16))
+            for r in range(16):
+                for c in range(16):
+                    color_idx = self.pixel_data[r][c]
+                    rgb = hex_to_rgb(PALETTE[color_idx])
+                    img.putpixel((c, r), rgb)
+            # Scale up 16x16 to 256x256 cleanly using nearest-neighbor
+            img_scaled = img.resize((256, 256), Image.Resampling.NEAREST)
+            img_scaled.save(file_path)
+            messagebox.showinfo("Success", f"Image successfully saved to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save image:\n{e}")
 
     def get_packed_canvas_bytes(self) -> bytes:
-        flat_nibbles = [self.pixel_data[r][c] for r in range(32) for c in range(32)]
+        flat_nibbles = [self.pixel_data[r][c] for r in range(16) for c in range(16)]
         packed = bytearray()
         for i in range(0, len(flat_nibbles), 2):
             high = flat_nibbles[i] & 0x0F
@@ -506,11 +535,10 @@ class SendPage(tk.Frame):
             self.status_lbl.config(text=f"Transmitting FILE ({len(payload)} bytes)...", fg="#a6e3a1")
         elif active_tab == 2:
             payload = self.get_packed_canvas_bytes()
-            self.status_lbl.config(text=f"Transmitting 32x32 IMAGE ({len(payload)} bytes)...", fg="#a6e3a1")
+            self.status_lbl.config(text=f"Transmitting 16x16 IMAGE ({len(payload)} bytes)...", fg="#a6e3a1")
         else:
             return
 
-        # Run transmission in background thread to keep GUI responsive
         threading.Thread(target=lambda: transmit_payload(payload), daemon=True).start()
 
 
@@ -520,6 +548,9 @@ class ReceivePage(tk.Frame):
         self.controller = controller
         self.is_listening = False
         self.receiver_thread = None
+        
+        # Track 16x16 pixel data buffer for saving received images
+        self.rx_pixel_data = [[0 for _ in range(16)] for _ in range(16)]
 
         nav = tk.Frame(self, bg="#181825", height=50)
         nav.pack(fill="x")
@@ -528,7 +559,7 @@ class ReceivePage(tk.Frame):
             bg="#313244", fg="#11111b", highlightbackground="#181825",
             command=lambda: controller.show_frame("HomePage")
         ).pack(side="left", padx=15, pady=10)
-        tk.Label(nav, text="RECEIVER & LIVE DECODER", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
+        tk.Label(nav, text="RECEIVER & LIVE 16x16 DECODER", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
 
         main_body = tk.Frame(self, bg="#1e1e2e")
         main_body.pack(fill="both", expand=True, padx=25, pady=20)
@@ -536,19 +567,26 @@ class ReceivePage(tk.Frame):
         left_col = tk.Frame(main_body, bg="#181825", padx=15, pady=15)
         left_col.pack(side="left", fill="y", padx=(0, 15))
 
-        tk.Label(left_col, text="Live 32x32 Image Feed", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(pady=(0, 10))
+        tk.Label(left_col, text="Live 16x16 Image Feed", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(pady=(0, 10))
 
-        self.rx_cell_size = 12
-        canvas_dim = 32 * self.rx_cell_size
+        self.rx_cell_size = 24
+        canvas_dim = 16 * self.rx_cell_size
         self.rx_canvas = tk.Canvas(left_col, width=canvas_dim, height=canvas_dim, bg="#000000", highlightthickness=2, highlightbackground="#585b70")
         self.rx_canvas.pack()
 
-        self.rx_rects = [[None for _ in range(32)] for _ in range(32)]
-        for r in range(32):
-            for c in range(32):
+        self.rx_rects = [[None for _ in range(16)] for _ in range(16)]
+        for r in range(16):
+            for c in range(16):
                 x1, y1 = c * self.rx_cell_size, r * self.rx_cell_size
                 x2, y2 = x1 + self.rx_cell_size, y1 + self.rx_cell_size
                 self.rx_rects[r][c] = self.rx_canvas.create_rectangle(x1, y1, x2, y2, fill="#000000", outline="#11111b")
+
+        # --- NEW: Save Received Image Button ---
+        tk.Button(
+            left_col, text="💾 Save Received Image (.png)", font=("Helvetica", 10, "bold"),
+            bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=24, pady=6, cursor="hand2",
+            command=self.save_received_image
+        ).pack(pady=(15, 0))
 
         right_col = tk.Frame(main_body, bg="#181825", padx=15, pady=15)
         right_col.pack(side="left", fill="both", expand=True)
@@ -571,6 +609,7 @@ class ReceivePage(tk.Frame):
             self.listen_btn.config(text="⏹️ STOP LISTENING", bg="#f38ba8")
             self.receiver_thread = ReceiverThread(
                 callback_packet_received=self.on_packet_received,
+                callback_pixel_received=self.update_rx_pixel_safely,
                 callback_log=self.append_log
             )
             self.receiver_thread.start()
@@ -586,21 +625,35 @@ class ReceivePage(tk.Frame):
             self.rx_text_box.see("end")
         self.after(0, _update)
 
+    def update_rx_pixel_safely(self, row, col, color_idx):
+        def _paint():
+            if 0 <= row < 16 and 0 <= col < 16 and 0 <= color_idx < 16:
+                self.rx_pixel_data[row][col] = color_idx  # Store in buffer
+                self.rx_canvas.itemconfig(self.rx_rects[row][col], fill=PALETTE[color_idx])
+        self.after(0, _paint)
+
+    def save_received_image(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png"), ("All files", "*.*")])
+        if not file_path:
+            return
+        try:
+            img = Image.new("RGB", (16, 16))
+            for r in range(16):
+                for c in range(16):
+                    color_idx = self.rx_pixel_data[r][c]
+                    rgb = hex_to_rgb(PALETTE[color_idx])
+                    img.putpixel((c, r), rgb)
+            img_scaled = img.resize((256, 256), Image.Resampling.NEAREST)
+            img_scaled.save(file_path)
+            messagebox.showinfo("Success", f"Received image successfully saved to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save received image:\n{e}")
+
     def on_packet_received(self, payload):
         def _handle():
-            # Check if payload is a 32x32 image (512 bytes)
-            if len(payload) == 512:
-                self.append_log("[INFO] Rendered received 32x32 image on canvas.\n")
-                nibbles = []
-                for b in payload:
-                    nibbles.append((b >> 4) & 0x0F)
-                    nibbles.append(b & 0X0F)
-                for idx, color_idx in enumerate(nibbles):
-                    r = idx // 32
-                    c = idx % 32
-                    self.update_rx_pixel(r, c, color_idx)
+            if len(payload) == 128:
+                self.append_log("[INFO] 16x16 Image packet fully verified by CRC!\n")
             else:
-                # Try decoding as UTF-8 text
                 try:
                     text_msg = payload.decode("utf-8")
                     self.append_log(f"Decoded Message:\n{text_msg}\n\n")
@@ -613,10 +666,6 @@ class ReceivePage(tk.Frame):
                         f.write(payload)
                     self.append_log(f"Saved to {filepath}\n")
         self.after(0, _handle)
-
-    def update_rx_pixel(self, row, col, color_idx):
-        if 0 <= row < 32 and 0 <= col < 32 and 0 <= color_idx < 16:
-            self.rx_canvas.itemconfig(self.rx_rects[row][col], fill=PALETTE[color_idx])
 
 
 if __name__ == "__main__":
