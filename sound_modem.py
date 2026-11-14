@@ -20,6 +20,8 @@ SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
 WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)  # 60ms analysis window
 STEP_SAMPLES = int(SAMPLE_RATE * 0.010)    # 10ms step during sync search
 
+CHUNK_SIZE = 16  # Bytes per chunk for Selective ARQ
+
 # Payload Type Identifiers
 TYPE_TEXT = 0x01
 TYPE_IMAGE = 0x02
@@ -74,20 +76,26 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
         wave = np.pad(wave, (0, guard_samples), mode='constant')
     return wave
 
-def build_packet(data_payload, payload_type):
-    full_payload = bytes([payload_type]) + data_payload
-    if len(full_payload) > 65535:
-        raise ValueError("Payload too large for 2-byte length header.")
-    
+def build_chunk_packet(chunk_idx, total_chunks, payload_type, chunk_data):
+    # Packet header format: [Chunk Index (1B)] [Total Chunks (1B)] [Payload Type (1B)] [Chunk Data]
+    header = struct.pack('BBB', chunk_idx, total_chunks, payload_type)
+    full_payload = header + chunk_data
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
     packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
     return packet
 
-def play_audio_waveform(data_payload, payload_type):
-    packet = build_packet(data_payload, payload_type)
-    bitstring = "".join(f"{byte:08b}" for byte in packet)
-    
+def build_control_packet(ctrl_type, target_chunk_idx):
+    # Control packet for ACK/NAK: [Type (1B)] [Chunk Index (1B)]
+    full_payload = struct.pack('BB', ctrl_type, target_chunk_idx)
+    crc = zlib.crc32(full_payload) & 0xFFFFFFFF
+    packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
+    return packet
+
+def play_audio_waveform(packet_bytes):
+    bitstring = "".join(f"{byte:08b}" for byte in packet_bytes)
     waves = []
+    
+    # Prepend 6 sync tones for preamble lock
     preamble_freqs = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
     for freq in preamble_freqs:
         waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
@@ -100,6 +108,8 @@ def play_audio_waveform(data_payload, payload_type):
     waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
     full_signal = np.concatenate(waves).astype(np.float32)
     
+    # Warmup pause so receiver input stream catches the beginning cleanly
+    time.sleep(0.4)
     sd.play(full_signal, samplerate=SAMPLE_RATE)
     sd.wait()
 
@@ -132,7 +142,7 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes(byte_list)
 
 
-def listen_for_ack_nak(timeout=4.0):
+def listen_for_ack_nak(expected_chunk_idx, timeout=4.0):
     start_time = time.time()
     ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
     state = "SEARCH_SYNC"
@@ -203,11 +213,12 @@ def listen_for_ack_nak(timeout=4.0):
                             received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
                             calculated_crc = zlib.crc32(full_payload) & 0xFFFFFFFF
                             
-                            if received_crc == calculated_crc and len(full_payload) > 0:
-                                p_type = full_payload[0]
-                                if p_type == TYPE_ACK:
+                            if received_crc == calculated_crc and len(full_payload) >= 2:
+                                c_type = full_payload[0]
+                                c_idx = full_payload[1]
+                                if c_type == TYPE_ACK and c_idx == expected_chunk_idx:
                                     return "ACK"
-                                elif p_type == TYPE_NAK:
+                                elif c_type == TYPE_NAK and c_idx == expected_chunk_idx:
                                     return "NAK"
                             return None
                             
@@ -217,61 +228,72 @@ def listen_for_ack_nak(timeout=4.0):
     return None
 
 
-def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3):
-    for attempt in range(1, max_retries + 1):
-        callback_status(f"Transmitting (Attempt {attempt}/{max_retries})...", "#89b4fa")
-        print(f"Transmitting packet (Attempt {attempt}/{max_retries})...")
+def transmit_payload_chunked(data_payload, payload_type, callback_status, max_retries=3):
+    """Splits payload into 16-byte chunks and transmits with Selective Chunk ARQ."""
+    # Split data into chunks of CHUNK_SIZE
+    chunks = [data_payload[i:i + CHUNK_SIZE] for i in range(0, len(data_payload), CHUNK_SIZE)]
+    total_chunks = len(chunks)
+    
+    callback_status(f"Transmitting {total_chunks} chunk(s)...", "#89b4fa")
+    
+    for chunk_idx in range(total_chunks):
+        chunk_data = chunks[chunk_idx]
+        success = False
         
-        try:
-            play_audio_waveform(data_payload, payload_type)
-        except Exception as e:
-            callback_status(f"Transmission error: {e}", "#f38ba8")
-            return False
-        
-        callback_status(f"Listening for ACK/NAK response...", "#f9e2af")
-        print("Listening for acknowledgment...")
-        time.sleep(0.3)
-        
-        response = listen_for_ack_nak(timeout=4.5)
-        if response == "ACK":
-            callback_status("Transmission SUCCESS! (ACK received)", "#a6e3a1")
-            print("Acknowledgment (ACK) received successfully.")
-            return True
-        elif response == "NAK":
-            callback_status(f"CRC Mismatch (NAK). Retrying...", "#fab387")
-            print("Receiver requested retransmission (NAK).")
-        else:
-            callback_status(f"No response heard. Retrying...", "#fab387")
-            print("No response heard (timeout). Retrying...")
+        for attempt in range(1, max_retries + 1):
+            print(f"Sending Chunk {chunk_idx + 1}/{total_chunks} (Attempt {attempt}/{max_retries})...")
+            packet = build_chunk_packet(chunk_idx, total_chunks, payload_type, chunk_data)
             
-    callback_status("Transmission FAILED after max retries.", "#f38ba8")
-    print("Transmission failed after max retries.")
-    return False
+            try:
+                play_audio_waveform(packet)
+            except Exception as e:
+                callback_status(f"Transmission error: {e}", "#f38ba8")
+                return False
+            
+            # Listen for specific ACK for this chunk
+            response = listen_for_ack_nak(expected_chunk_idx=chunk_idx, timeout=3.5)
+            if response == "ACK":
+                print(f"Chunk {chunk_idx + 1} acknowledged.")
+                success = True
+                break
+            else:
+                print(f"Chunk {chunk_idx + 1} NAK or Timeout. Retrying chunk...")
+                time.sleep(0.2)
+                
+        if not success:
+            callback_status(f"Transmission FAILED on chunk {chunk_idx + 1}.", "#f38ba8")
+            print(f"Failed to transmit chunk {chunk_idx + 1} after {max_retries} attempts.")
+            return False
+            
+    callback_status("Transmission SUCCESS! All chunks verified.", "#a6e3a1")
+    print("Complete payload successfully transmitted and acknowledged.")
+    return True
 
 
 class ReceiverThread(threading.Thread):
-    def __init__(self, callback_packet_received, callback_pixel_received, callback_log):
+    def __init__(self, callback_packet_fully_received, callback_pixel_received, callback_log):
         super().__init__()
         self.daemon = True
-        self.callback_packet_received = callback_packet_received
+        self.callback_packet_fully_received = callback_packet_fully_received
         self.callback_pixel_received = callback_pixel_received
         self.callback_log = callback_log
         self.running = False
 
     def run(self):
         self.running = True
-        self.callback_log("[INFO] Receiver listening for acoustic transmission...\n")
+        self.callback_log("[INFO] Receiver listening for chunked transmission...\n")
         
         ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
         state = "SEARCH_SYNC"
         samples_until_next_read = 0
         nibbles = []
         expected_nibbles = None
-        payload_len = 0
-        is_image_packet = False
         expected_sync = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
         sync_armed = False
         best_sync_snr = 0.0
+
+        # Assembly buffers for multi-chunk payloads
+        assembled_payloads = {}  # payload_type -> {total_chunks, received_chunks_dict}
 
         try:
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
@@ -298,22 +320,18 @@ class ReceiverThread(threading.Thread):
                                 best_sync_snr = last_snr
                                 sync_armed = True
                             elif sync_armed:
-                                self.callback_log("\n[SYNC LOCKED] Receiving packet...\n")
+                                self.callback_log("\n[SYNC LOCKED] Receiving chunk...\n")
                                 state = "RECEIVE_DATA"
                                 nibbles = []
                                 expected_nibbles = None
-                                payload_len = 0
-                                is_image_packet = False
                                 sync_armed = False
                                 best_sync_snr = 0.0
                                 samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
                         elif sync_armed:
-                            self.callback_log("\n[SYNC LOCKED] Receiving packet...\n")
+                            self.callback_log("\n[SYNC LOCKED] Receiving chunk...\n")
                             state = "RECEIVE_DATA"
                             nibbles = []
                             expected_nibbles = None
-                            payload_len = 0
-                            is_image_packet = False
                             sync_armed = False
                             best_sync_snr = 0.0
                             samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
@@ -333,39 +351,67 @@ class ReceiverThread(threading.Thread):
                                 payload_len = struct.unpack('>H', length_bytes)[0]
                                 expected_nibbles = (2 + payload_len + 4) * 2
 
-                            elif current_nibble_count == 6:
-                                type_bytes = decode_nibbles_to_bytes(nibbles[4:6])
-                                payload_type = type_bytes[0]
-                                if payload_type == TYPE_IMAGE:
-                                    is_image_packet = True
-                                    self.callback_log("  Detected 16x16 Image stream. Rendering live...\n")
-                                elif payload_type == TYPE_TEXT:
-                                    self.callback_log("  Detected Text Message stream...\n")
-                                else:
-                                    self.callback_log("  Detected Binary File stream...\n")
-
-                            elif current_nibble_count > 6 and is_image_packet:
-                                pixel_idx = current_nibble_count - 7
-                                if pixel_idx < 256:
-                                    r = pixel_idx // 16
-                                    c = pixel_idx % 16
-                                    self.callback_pixel_received(r, c, best_data_idx)
-
                             if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
                                 raw_bytes = decode_nibbles_to_bytes(nibbles)
                                 full_payload = raw_bytes[2:-4]
                                 received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
                                 calculated_crc = zlib.crc32(full_payload) & 0xFFFFFFFF
                                 
-                                if received_crc == calculated_crc:
-                                    self.callback_log(f"[SUCCESS] CRC Valid! Sending ACK back...\n")
-                                    self.callback_packet_received(full_payload)
+                                if received_crc == calculated_crc and len(full_payload) >= 3:
+                                    chunk_idx = full_payload[0]
+                                    total_chunks = full_payload[1]
+                                    payload_type = full_payload[2]
+                                    chunk_data = full_payload[3:]
+                                    
+                                    self.callback_log(f"  [CRC OK] Received Chunk {chunk_idx + 1}/{total_chunks} (Type {payload_type}). Sending ACK.\n")
+                                    
+                                    # Send ACK back for this specific chunk
                                     time.sleep(0.3)
-                                    play_audio_waveform(b"", TYPE_ACK)
+                                    ack_packet = build_control_packet(TYPE_ACK, chunk_idx)
+                                    play_audio_waveform(ack_packet)
+                                    
+                                    # Initialize assembly tracker if new type
+                                    if payload_type not in assembled_payloads:
+                                        assembled_payloads[payload_type] = {
+                                            'total_chunks': total_chunks,
+                                            'chunks': {}
+                                        }
+                                    
+                                    # Store chunk data
+                                    assembled_payloads[payload_type]['chunks'][chunk_idx] = chunk_data
+                                    
+                                    # If it's an image chunk, update live pixels immediately
+                                    if payload_type == TYPE_IMAGE:
+                                        # Each chunk contains up to 16 bytes = 32 nibbles = 16 pixels
+                                        base_pixel_idx = chunk_idx * CHUNK_SIZE * 2
+                                        for p_offset in range(len(chunk_data) * 2):
+                                            byte_idx = p_offset // 2
+                                            is_high_nibble = (p_offset % 2 == 0)
+                                            b_val = chunk_data[byte_idx]
+                                            color_idx = (b_val >> 4) if is_high_nibble else (b_val & 0x0F)
+                                            
+                                            abs_pixel_idx = base_pixel_idx + p_offset
+                                            if abs_pixel_idx < 256:
+                                                r = abs_pixel_idx // 16
+                                                c = abs_pixel_idx % 16
+                                                self.callback_pixel_received(r, c, color_idx)
+
+                                    # Check if all chunks for this payload are received
+                                    p_info = assembled_payloads[payload_type]
+                                    if len(p_info['chunks']) == p_info['total_chunks']:
+                                        # Reconstruct complete payload
+                                        complete_data = b"".join(p_info['chunks][i] for i in range(p_info['total_chunks']))
+                                        full_complete_payload = bytes([payload_type]) + complete_data
+                                        self.callback_packet_fully_received(full_complete_payload)
+                                        del assembled_payloads[payload_type]
+                                        
                                 else:
-                                    self.callback_log(f"[ERROR] CRC Mismatch! Sending NAK request for resend...\n")
+                                    self.callback_log(f"  [CRC ERROR] Chunk Mismatch! Sending NAK.\n")
+                                    # Extract chunk_idx if possible from partial raw bytes to NAK the right one
+                                    bad_idx = raw_bytes[2] if len(raw_bytes) > 2 else 0
                                     time.sleep(0.3)
-                                    play_audio_waveform(b"", TYPE_NAK)
+                                    nak_packet = build_control_packet(TYPE_NAK, bad_idx)
+                                    play_audio_waveform(nak_packet)
                                     
                                 state = "SEARCH_SYNC"
                                 ring_buffer.fill(0)
@@ -384,7 +430,7 @@ class ReceiverThread(threading.Thread):
 class SoundModemApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Acoustic Data & Image Transceiver with ARQ")
+        self.title("Acoustic Data & Image Transceiver with Chunk ARQ")
         self.geometry("900x680")
         self.configure(bg="#1e1e2e")
         self.resizable(False, False)
@@ -415,7 +461,7 @@ class HomePage(tk.Frame):
         title = tk.Label(self, text="SONIC MODEM", font=("Helvetica", 32, "bold"), fg="#cdd6f4", bg="#1e1e2e")
         title.pack(pady=(120, 10))
 
-        subtitle = tk.Label(self, text="Acoustic Transceiver with Automatic Resend (ARQ)", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
+        subtitle = tk.Label(self, text="Acoustic Transceiver with Selective Chunk ARQ", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
         subtitle.pack(pady=(0, 60))
 
         btn_frame = tk.Frame(self, bg="#1e1e2e")
@@ -450,7 +496,7 @@ class SendPage(tk.Frame):
             bg="#313244", fg="#11111b", highlightbackground="#181825",
             command=lambda: controller.show_frame("HomePage")
         ).pack(side="left", padx=15, pady=10)
-        tk.Label(nav, text="TRANSMIT DATA WITH ARQ", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
+        tk.Label(nav, text="TRANSMIT DATA WITH CHUNK ARQ", font=("Helvetica", 14, "bold"), bg="#181825", fg="#cdd6f4").pack(side="left", padx=15)
 
         style = ttk.Style()
         style.theme_use("default")
@@ -489,7 +535,7 @@ class SendPage(tk.Frame):
         tk.Label(self.tab_text, text="Enter UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
         self.text_input = tk.Text(self.tab_text, height=14, font=("Courier", 13), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4", relief="flat")
         self.text_input.pack(fill="x", padx=20, pady=10)
-        self.text_input.insert("1.0", "Hello World! Testing acoustic FSK modem with ARQ.")
+        self.text_input.insert("1.0", "Hello World! Testing acoustic FSK modem with Chunk ARQ.")
 
     def _build_file_tab(self):
         self.selected_file_path = None
@@ -682,7 +728,7 @@ class SendPage(tk.Frame):
             return
 
         threading.Thread(
-            target=lambda: transmit_with_arq(payload, payload_type, self.update_status, max_retries=3),
+            target=lambda: transmit_payload_chunked(payload, payload_type, self.update_status, max_retries=3),
             daemon=True
         ).start()
 
@@ -750,7 +796,7 @@ class ReceivePage(tk.Frame):
         if self.is_listening:
             self.listen_btn.config(text="⏹️ STOP LISTENING", bg="#f38ba8")
             self.receiver_thread = ReceiverThread(
-                callback_packet_received=self.on_packet_received,
+                callback_packet_fully_received=self.on_packet_received,
                 callback_pixel_received=self.update_rx_pixel_safely,
                 callback_log=self.append_log
             )
@@ -797,15 +843,15 @@ class ReceivePage(tk.Frame):
             actual_data = full_payload[1:]
 
             if payload_type == TYPE_IMAGE:
-                self.append_log(f"[SUCCESS] 16x16 Image packet verified by CRC! Sent ACK.\n")
+                self.append_log(f"[SUCCESS] 16x16 Image fully received and verified!\n\n")
             elif payload_type == TYPE_TEXT:
                 try:
                     text_msg = actual_data.decode("utf-8")
-                    self.append_log(f"Decoded Message:\n{text_msg}\n[SUCCESS] Sent ACK.\n\n")
+                    self.append_log(f"Decoded Message:\n{text_msg}\n[SUCCESS] Verified.\n\n")
                 except UnicodeDecodeError:
                     self.append_log(f"[ERROR] Text payload contained invalid UTF-8 bytes.\n")
             elif payload_type == TYPE_FILE:
-                self.append_log(f"Received binary file ({len(actual_data)} bytes). Saving to ./received/ [SUCCESS] Sent ACK.\n")
+                self.append_log(f"Received binary file ({len(actual_data)} bytes). Saving to ./received/\n")
                 os.makedirs("received", exist_ok=True)
                 filename = datetime.now().strftime("received_%Y%m%d_%H%M%S.bin")
                 filepath = os.path.join("received", filename)
