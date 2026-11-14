@@ -105,12 +105,8 @@ def play_audio_waveform(data_payload, payload_type):
 
 
 # ============================================================================
-# DECODER & DRIFT-RESILIENT LISTENER FUNCTIONS
+# DECODER & LISTENER FUNCTIONS
 # ============================================================================
-def envelope(x, sample_rate, ms=2.0):
-    n = max(1, int(sample_rate * ms / 1000))
-    return np.convolve(np.abs(x), np.ones(n) / n, mode="same")
-
 def analyze_window(samples):
     samples = samples - np.mean(samples)
     windowed = samples * HANN
@@ -136,7 +132,7 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes(byte_list)
 
 
-def listen_for_ack_nak(timeout=3.0):
+def listen_for_ack_nak(timeout=4.0):
     start_time = time.time()
     ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
     state = "SEARCH_SYNC"
@@ -236,7 +232,7 @@ def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3
         print("Listening for acknowledgment...")
         time.sleep(0.3)
         
-        response = listen_for_ack_nak(timeout=4.0)
+        response = listen_for_ack_nak(timeout=4.5)
         if response == "ACK":
             callback_status("Transmission SUCCESS! (ACK received)", "#a6e3a1")
             print("Acknowledgment (ACK) received successfully.")
@@ -266,10 +262,9 @@ class ReceiverThread(threading.Thread):
         self.running = True
         self.callback_log("[INFO] Receiver listening for acoustic transmission...\n")
         
-        ring_buffer = np.zeros(SYMBOL_SAMPLES * 8, dtype=np.float32)
+        ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
         state = "SEARCH_SYNC"
-        spb = SYMBOL_SAMPLES
-        p = 0.0  # Sample pointer for drift tracking
+        samples_until_next_read = 0
         nibbles = []
         expected_nibbles = None
         payload_len = 0
@@ -291,7 +286,7 @@ class ReceiverThread(threading.Thread):
                         detected_sync = []
                         last_snr = 0.0
                         for k in range(6):
-                            end_offset = -((5 - k) * spb + int(SAMPLE_RATE * 0.010))
+                            end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))
                             start_offset = end_offset - WINDOW_SAMPLES
                             freq, snr, _ = analyze_window(ring_buffer[start_offset:end_offset])
                             detected_sync.append(freq)
@@ -303,7 +298,7 @@ class ReceiverThread(threading.Thread):
                                 best_sync_snr = last_snr
                                 sync_armed = True
                             elif sync_armed:
-                                self.callback_log("\n[SYNC LOCKED] Receiving packet with drift tracking...\n")
+                                self.callback_log("\n[SYNC LOCKED] Receiving packet...\n")
                                 state = "RECEIVE_DATA"
                                 nibbles = []
                                 expected_nibbles = None
@@ -311,10 +306,9 @@ class ReceiverThread(threading.Thread):
                                 is_image_packet = False
                                 sync_armed = False
                                 best_sync_snr = 0.0
-                                # Initialize pointer `p` at the end of the ring buffer (current time)
-                                p = float(len(ring_buffer)) - int(0.010 * SAMPLE_RATE)
+                                samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
                         elif sync_armed:
-                            self.callback_log("\n[SYNC LOCKED] Receiving packet with drift tracking...\n")
+                            self.callback_log("\n[SYNC LOCKED] Receiving packet...\n")
                             state = "RECEIVE_DATA"
                             nibbles = []
                             expected_nibbles = None
@@ -322,27 +316,14 @@ class ReceiverThread(threading.Thread):
                             is_image_packet = False
                             sync_armed = False
                             best_sync_snr = 0.0
-                            p = float(len(ring_buffer)) - int(0.010 * SAMPLE_RATE)
-
+                            samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
                     elif state == "RECEIVE_DATA":
-                        # Advance pointer by one symbol duration
-                        nxt = p + spb
-                        
-                        # Track clock drift using envelope dips between symbols (+/- 5ms search window)
-                        env = envelope(ring_buffer, SAMPLE_RATE)
-                        search = int(0.005 * SAMPLE_RATE)
-                        lo, hi = int(nxt) - search, int(nxt) + search
-                        if lo >= 0 and hi <= len(env):
-                            found = lo + int(np.argmin(env[lo:hi]))
-                            nxt += 0.5 * (found - nxt)
-
-                        # Extract centered analysis window avoiding boundaries
-                        margin = int(0.2 * spb)
-                        a = int(nxt) - spb + margin
-                        b = int(nxt) - margin
-                        
-                        if a >= 0 and b <= len(ring_buffer):
-                            window = ring_buffer[a:b]
+                        samples_until_next_read -= STEP_SAMPLES
+                        if samples_until_next_read <= 0:
+                            end_offset = -int(SAMPLE_RATE * 0.010)
+                            start_offset = end_offset - WINDOW_SAMPLES
+                            window = ring_buffer[start_offset:end_offset]
+                            
                             _, _, best_data_idx = analyze_window(window)
                             nibbles.append(best_data_idx)
                             current_nibble_count = len(nibbles)
@@ -388,11 +369,8 @@ class ReceiverThread(threading.Thread):
                                     
                                 state = "SEARCH_SYNC"
                                 ring_buffer.fill(0)
-
-                        p = nxt
-                        # Yield briefly to match block timing
-                        time.sleep(SYMBOL_DURATION * 0.8)
-
+                                
+                            samples_until_next_read += SYMBOL_SAMPLES
         except Exception as e:
             self.callback_log(f"[INFO] Receiver stream stopped: {e}\n")
 
@@ -406,7 +384,7 @@ class ReceiverThread(threading.Thread):
 class SoundModemApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Acoustic Data & Image Transceiver with ARQ & Drift Correction")
+        self.title("Acoustic Data & Image Transceiver with ARQ")
         self.geometry("900x680")
         self.configure(bg="#1e1e2e")
         self.resizable(False, False)
@@ -437,7 +415,7 @@ class HomePage(tk.Frame):
         title = tk.Label(self, text="SONIC MODEM", font=("Helvetica", 32, "bold"), fg="#cdd6f4", bg="#1e1e2e")
         title.pack(pady=(120, 10))
 
-        subtitle = tk.Label(self, text="Acoustic Transceiver with ARQ & Clock Drift Correction", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
+        subtitle = tk.Label(self, text="Acoustic Transceiver with Automatic Resend (ARQ)", font=("Helvetica", 14), fg="#a6adc8", bg="#1e1e2e")
         subtitle.pack(pady=(0, 60))
 
         btn_frame = tk.Frame(self, bg="#1e1e2e")
