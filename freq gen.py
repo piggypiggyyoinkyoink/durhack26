@@ -2,8 +2,8 @@ import numpy as np
 import sounddevice as sd
 
 # Audio parameters
-frequency = 4400.0    # Frequency in Hz (e.g., 440 Hz = A4)
-duration = 2.0       # Duration in seconds
+frequency = 6000.0    # Frequency in Hz (e.g., 440 Hz = A4)
+duration = 6.0       # Duration in seconds
 sample_rate = 44100  # Samples per second (CD quality)
 amplitude = 0.5      # Volume (0.0 to 1.0)
 
