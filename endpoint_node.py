@@ -242,7 +242,6 @@ def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3
 
     callback_status(f"Upload SUCCESS! Waiting for router target delivery confirmation...", "#a6e3a1")
     
-    # Wait for delivery response (either SUCCESS or FAIL from router paging target)
     success_deliv, deliv_data = listen_for_response(TYPE_FORWARD_FAIL, timeout=8.0)
     if success_deliv:
         callback_status("DELIVERY FAILED: Target was unreachable.", "#f38ba8")
@@ -325,7 +324,7 @@ def listen_for_ack_nak_local(timeout=4.0):
     return None, None
 
 # ============================================================================
-# ENDPOINT RECEIVER THREAD (HANDLES PAGING RESPONSES & INCOMING FORWARDED DATA)
+# ENDPOINT RECEIVER THREAD
 # ============================================================================
 class EndpointReceiverThread(threading.Thread):
     def __init__(self, my_addr, callback_packet_received, callback_pixel_received, callback_log):
@@ -441,14 +440,12 @@ class EndpointReceiverThread(threading.Thread):
                                 if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
                                     p_type = full_payload[0]
                                     
-                                    # Check for Router Paging Request (`TYPE_FORWARD_REQ`)
                                     if p_type == TYPE_FORWARD_REQ and len(full_payload) >= 5:
                                         target_addr, sender_addr = struct.unpack('>HH', full_payload[1:5])
                                         if target_addr == self.my_addr:
                                             self.callback_log(f"[PAGED] Router paged us for incoming transfer from {sender_addr}. Replying READY...\n")
                                             self._send_control_response(stream, ring_buffer, b"", TYPE_FORWARD_RESP)
                                     
-                                    # Forwarded Data Packets
                                     elif p_type in (TYPE_TEXT, TYPE_IMAGE, TYPE_FILE) and len(full_payload) >= 5:
                                         p_type_data, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
                                         chunk_data = full_payload[5:]
@@ -623,6 +620,14 @@ class EndpointApp(tk.Tk):
         tk.Button(tools_frame, text="Fill Canvas with Selected", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=self.fill_canvas).pack(pady=3)
         tk.Button(tools_frame, text="Clear Canvas (Black)", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=lambda: self.fill_canvas(0)).pack(pady=3)
         tk.Button(tools_frame, text="Load Test Pattern", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=self.load_test_pattern).pack(pady=3)
+        
+        # --- NEW BUTTON: Load Saved Image into 16x16 Editor ---
+        tk.Button(
+            tools_frame, text="📁 Load Saved Image (.png)", font=("Helvetica", 9, "bold"),
+            bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=22, pady=4, cursor="hand2",
+            command=self.load_editor_image
+        ).pack(pady=3)
+
         tk.Button(
             tools_frame, text="💾 Save Drawn Image (.png)", font=("Helvetica", 9, "bold"),
             bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=22, pady=5, cursor="hand2",
@@ -749,6 +754,26 @@ class EndpointApp(tk.Tk):
         for r in range(16):
             for c in range(16):
                 self.set_grid_pixel(r, c, ((r // 4) * 4 + (c // 4)) % 16)
+
+    def load_editor_image(self):
+        """Loads a saved upscaled PNG image back into the 16x16 grid."""
+        file_path = filedialog.askopenfilename(title="Open Saved 16x16 Image", filetypes=[("PNG files", "*.png"), ("All files", "*.*")])
+        if not file_path:
+            return
+        try:
+            img = Image.open(file_path).convert("RGB")
+            img = img.resize((16, 16), Image.Resampling.NEAREST)
+            for r in range(16):
+                for c in range(16):
+                    rgb = img.getpixel((c, r))
+                    closest_idx = min(
+                        range(16),
+                        key=lambda i: sum((rgb[k] - hex_to_rgb(PALETTE[i])[k]) ** 2 for k in range(3))
+                    )
+                    self.set_grid_pixel(r, c, closest_idx)
+            messagebox.showinfo("Success", "Image successfully loaded into 16x16 editor grid!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load image:\n{e}")
 
     def save_drawn_image(self):
         file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png"), ("All files", "*.*")])
