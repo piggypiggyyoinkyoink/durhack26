@@ -121,7 +121,7 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes([int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8)])
 
 # ============================================================================
-# PERSISTENT-STREAM SESSION LISTENERS (Eliminates stream startup latency)
+# PERSISTENT-STREAM SESSION LISTENERS
 # ============================================================================
 def _listen_response_stream(expected_type, timeout, stream, ring_buffer):
     start_time = time.time()
@@ -554,17 +554,14 @@ class EndpointApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=20, pady=10)
 
         self.tab_send_text = tk.Frame(self.notebook, bg="#181825")
-        self.tab_send_file = tk.Frame(self.notebook, bg="#181825")
         self.tab_editor = tk.Frame(self.notebook, bg="#181825")
         self.tab_receive = tk.Frame(self.notebook, bg="#181825")
 
         self.notebook.add(self.tab_send_text, text="   1. Text Message   ")
-        self.notebook.add(self.tab_send_file, text="   2. Choose File   ")
-        self.notebook.add(self.tab_editor, text="   3. 16x16 Pixel Editor   ")
-        self.notebook.add(self.tab_receive, text="   4. Listen / Receive Feed   ")
+        self.notebook.add(self.tab_editor, text="   2. 16x16 Pixel Editor   ")
+        self.notebook.add(self.tab_receive, text="   3. Listen / Receive Feed   ")
 
         self._build_text_tab()
-        self._build_file_tab()
         self._build_editor_tab()
         self._build_receive_tab()
 
@@ -581,28 +578,33 @@ class EndpointApp(tk.Tk):
         self.tx_btn.pack(side="right", padx=20, pady=10)
 
     def _build_text_tab(self):
-        tk.Label(self.tab_send_text, text="Enter UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
-        self.text_input = tk.Text(self.tab_send_text, height=10, font=("Courier", 12), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4")
-        self.text_input.pack(fill="x", padx=20, pady=10)
+        tk.Label(self.tab_send_text, text="Enter or Load UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
+        
+        btn_frame = tk.Frame(self.tab_send_text, bg="#181825")
+        btn_frame.pack(fill="x", padx=20, pady=(0, 5))
+
+        tk.Button(
+            btn_frame, text="📁 Load Text File (.txt)", font=("Helvetica", 9, "bold"),
+            bg="#89b4fa", fg="#11111b", highlightbackground="#181825", padx=10, pady=4, cursor="hand2",
+            command=self.load_text_file
+        ).pack(anchor="w")
+
+        self.text_input = tk.Text(self.tab_send_text, height=12, font=("Courier", 12), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4")
+        self.text_input.pack(fill="both", expand=True, padx=20, pady=10)
         self.text_input.insert("1.0", "Hello through the central store-and-forward acoustic router!")
 
-    def _build_file_tab(self):
-        self.selected_file_path = None
-        self.raw_file_bytes = None
-        frame = tk.Frame(self.tab_send_file, bg="#181825")
-        frame.pack(expand=True)
-
-        tk.Button(frame, text="📁 Browse File...", font=("Helvetica", 12, "bold"), bg="#89b4fa", fg="#11111b", command=self.choose_file).pack(pady=10)
-        self.file_info_lbl = tk.Label(frame, text="No file selected.", font=("Helvetica", 11), bg="#181825", fg="#a6adc8")
-        self.file_info_lbl.pack(pady=10)
-
-    def choose_file(self):
-        path = filedialog.askopenfilename()
-        if not path: return
-        self.selected_file_path = path
-        with open(path, "rb") as f:
-            self.raw_file_bytes = f.read()
-        self.file_info_lbl.config(text=f"Selected: {path.split('/')[-1]} ({len(self.raw_file_bytes)} bytes)")
+    def load_text_file(self):
+        file_path = filedialog.askopenfilename(title="Open Text File", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if not file_path:
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.text_input.delete("1.0", "end")
+            self.text_input.insert("1.0", content)
+            messagebox.showinfo("Success", f"Text file successfully loaded from:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load text file:\n{e}")
 
     def _build_editor_tab(self):
         self.grid_size = 16
@@ -839,16 +841,10 @@ class EndpointApp(tk.Tk):
             payload = self.text_input.get("1.0", "end-1c").encode("utf-8")
             payload_type = TYPE_TEXT
         elif active_tab == 1:
-            if not self.raw_file_bytes:
-                messagebox.showwarning("Warning", "Please select a file first.")
-                return
-            payload = self.raw_file_bytes
-            payload_type = TYPE_FILE
-        elif active_tab == 2:
             payload = self.get_packed_canvas_bytes()
             payload_type = TYPE_IMAGE
         else:
-            messagebox.showinfo("Info", "Switch to a send tab (Text, File, or Editor) to transmit data.")
+            messagebox.showinfo("Info", "Switch to a send tab (Text or Editor) to transmit data.")
             return
 
         def _task():
