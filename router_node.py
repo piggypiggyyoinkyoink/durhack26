@@ -76,13 +76,20 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     return wave
 
 def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
-    # Include TYPE_HS_REQ and TYPE_TARGET_REQ here so they bypass the sequence header
-    if payload_type in (TYPE_ACK, TYPE_NAK, TYPE_HS_RESP, TYPE_TARGET_RESP, 
-                        TYPE_FORWARD_RESP, TYPE_FORWARD_FAIL, TYPE_HS_REQ, TYPE_TARGET_REQ):
+    # Control and handshake packets bypass the data chunk sequence headers
+    control_types = (
+        TYPE_ACK, TYPE_NAK, 
+        TYPE_HS_REQ, TYPE_HS_RESP, 
+        TYPE_TARGET_REQ, TYPE_TARGET_RESP, 
+        TYPE_FORWARD_REQ, TYPE_FORWARD_RESP, TYPE_FORWARD_FAIL
+    )
+    
+    if payload_type in control_types:
         full_payload = bytes([payload_type]) + data_payload
     else:
         header = struct.pack('>BHH', payload_type, seq_num, total_packets)
         full_payload = header + data_payload
+        
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
     return struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
 
