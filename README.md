@@ -1,5 +1,5 @@
 ### Disclaimer: Code in this repo was developed with AI assistance
-# So-Fi - Basically wi-fi but using sound waves instead of radio waves
+# So-Fi - Wi-Fi, but using sound waves instead of radio waves
 #### Submitted to DurHack 2026
 
 ## About 
