@@ -76,20 +76,17 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     return wave
 
 def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
-    # Control and handshake packets bypass the data chunk sequence headers
     control_types = (
         TYPE_ACK, TYPE_NAK, 
         TYPE_HS_REQ, TYPE_HS_RESP, 
         TYPE_TARGET_REQ, TYPE_TARGET_RESP, 
         TYPE_FORWARD_REQ, TYPE_FORWARD_RESP, TYPE_FORWARD_FAIL
     )
-    
     if payload_type in control_types:
         full_payload = bytes([payload_type]) + data_payload
     else:
         header = struct.pack('>BHH', payload_type, seq_num, total_packets)
         full_payload = header + data_payload
-        
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
     return struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
 
@@ -124,15 +121,16 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes([int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8)])
 
 # ============================================================================
-# ROUTER THREAD WITH STORE-AND-FORWARD PAGING (Robust 25ms Timing & Sync Arming)
+# ROUTER THREAD WITH LIVE CHUNK RENDERING
 # ============================================================================
 class TkinterRouterThread(threading.Thread):
-    def __init__(self, router_addr, log_callback, data_callback):
+    def __init__(self, router_addr, log_callback, data_callback, pixel_callback=None):
         super().__init__()
         self.daemon = True
         self.router_addr = router_addr
         self.log_callback = log_callback
         self.data_callback = data_callback
+        self.pixel_callback = pixel_callback
         self.running = False
         self.active_sender = None
         self.active_target = None
@@ -164,7 +162,8 @@ class TkinterRouterThread(threading.Thread):
                 detected_sync = []
                 last_snr = 0.0
                 for k in range(6):
-                    freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
+                    end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))
+                    freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
                     detected_sync.append(freq)
                     if k == 5:
                         last_snr = snr
@@ -230,7 +229,8 @@ class TkinterRouterThread(threading.Thread):
                 detected_sync = []
                 last_snr = 0.0
                 for k in range(6):
-                    freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
+                    end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))
+                    freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
                     detected_sync.append(freq)
                     if k == 5:
                         last_snr = snr
@@ -348,7 +348,8 @@ class TkinterRouterThread(threading.Thread):
                         detected_sync = []
                         last_snr = 0.0
                         for k in range(6):
-                            freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
+                            end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))
+                            freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
                             detected_sync.append(freq)
                             if k == 5:
                                 last_snr = snr
@@ -419,6 +420,16 @@ class TkinterRouterThread(threading.Thread):
                                         if seq_num == expected_seq:
                                             reassembly_buffer[seq_num] = chunk_data
                                             self.log_callback(f"[UPLOAD RX] Packet {seq_num + 1}/{total_pkts} received from Sender {self.active_sender}. Sending ACK.\n")
+                                            
+                                            # --- LIVE PREVIEW FEED UPDATE ---
+                                            if active_transfer_type == TYPE_IMAGE and self.pixel_callback:
+                                                base_pixel_idx = seq_num * CHUNK_SIZE * 2
+                                                for i, b in enumerate(chunk_data):
+                                                    n1, n2 = (b >> 4) & 0x0F, b & 0x0F
+                                                    p1, p2 = base_pixel_idx + (i * 2), base_pixel_idx + (i * 2) + 1
+                                                    if p1 < 256: self.pixel_callback(p1 // 16, p1 % 16, n1)
+                                                    if p2 < 256: self.pixel_callback(p2 // 16, p2 % 16, n2)
+
                                             self._send_response(stream, ring_buffer, struct.pack('>H', seq_num), TYPE_ACK)
                                             expected_seq += 1
 
@@ -516,15 +527,17 @@ class RouterApp(tk.Tk):
             self.log_box.see("end")
         self.after(0, _update)
 
+    def update_router_pixel_safely(self, row, col, color_idx):
+        def _paint():
+            if 0 <= row < 16 and 0 <= col < 16 and 0 <= color_idx < len(PALETTE):
+                self.preview_canvas.itemconfig(self.preview_rects[row][col], fill=PALETTE[color_idx])
+        self.after(0, _paint)
+
     def display_received_data(self, p_type, data, sender, target):
         def _render():
             self.data_text_box.delete("1.0", "end")
             header_str = f"--- Payload Uploaded (From: {sender} -> Target: {target}) ---\n\n"
             self.data_text_box.insert("end", header_str)
-
-            for r in range(16):
-                for c in range(16):
-                    self.preview_canvas.itemconfig(self.preview_rects[r][c], fill="#000000")
 
             if p_type == TYPE_TEXT:
                 try:
@@ -534,15 +547,6 @@ class RouterApp(tk.Tk):
                     self.data_text_box.insert("end", f"Decoded binary text error: {e}")
             elif p_type == TYPE_IMAGE:
                 self.data_text_box.insert("end", "Reconstructed 16x16 Pixel Image:\n")
-                flat_nibbles = []
-                for b in data:
-                    flat_nibbles.append((b >> 4) & 0x0F)
-                    flat_nibbles.append(b & 0x0F)
-                for idx, color_idx in enumerate(flat_nibbles[:256]):
-                    r = idx // 16
-                    c = idx % 16
-                    if 0 <= color_idx < len(PALETTE):
-                        self.preview_canvas.itemconfig(self.preview_rects[r][c], fill=PALETTE[color_idx])
             elif p_type == TYPE_FILE:
                 os.makedirs("router_stored", exist_ok=True)
                 filename = datetime.now().strftime("forward_%Y%m%d_%H%M%S.bin")
@@ -568,7 +572,8 @@ class RouterApp(tk.Tk):
             self.router_thread = TkinterRouterThread(
                 router_addr=r_addr,
                 log_callback=self.log_msg,
-                data_callback=self.display_received_data
+                data_callback=self.display_received_data,
+                pixel_callback=self.update_router_pixel_safely
             )
             self.router_thread.start()
         else:
