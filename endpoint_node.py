@@ -361,6 +361,7 @@ class EndpointReceiverThread(threading.Thread):
         self.callback_pixel_received = callback_pixel_received
         self.callback_log = callback_log
         self.running = False
+        self.is_paged = False  # Gatekeeper flag: ignore traffic until paged by router
 
     def _send_control_response(self, stream, ring_buffer, payload, control_type):
         time.sleep(0.3)
@@ -372,7 +373,7 @@ class EndpointReceiverThread(threading.Thread):
 
     def run(self):
         self.running = True
-        self.callback_log(f"[INFO] Endpoint listener active on ID {self.my_addr}...\n")
+        self.callback_log(f"[INFO] Endpoint listener active on ID {self.my_addr} (Waiting for router page)...\n")
         
         ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
         state = "SEARCH_SYNC"
@@ -452,7 +453,7 @@ class EndpointReceiverThread(threading.Thread):
                                 except Exception:
                                     pass
 
-                            elif (expected_nibbles is not None and 14 < current_nibble_count <= expected_nibbles - 8 and is_image_packet):
+                            elif (expected_nibbles is not None and 14 < current_nibble_count <= expected_nibbles - 8 and is_image_packet and self.is_paged):
                                 nibble_in_chunk = current_nibble_count - 15
                                 pixel_idx = (current_seq_num * CHUNK_SIZE * 2) + nibble_in_chunk
                                 if pixel_idx < 256:
@@ -466,13 +467,23 @@ class EndpointReceiverThread(threading.Thread):
                                 if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
                                     p_type = full_payload[0]
                                     
+                                    # 1. Handle Paging Request from Router
                                     if p_type == TYPE_FORWARD_REQ and len(full_payload) >= 5:
                                         target_addr, sender_addr = struct.unpack('>HH', full_payload[1:5])
                                         if target_addr == self.my_addr:
-                                            self.callback_log(f"[PAGED] Router paged us for incoming transfer from {sender_addr}. Replying READY...\n")
+                                            self.is_paged = True  # Unlock receiver for this session
+                                            self.callback_log(f"[PAGED] Router called our address! Incoming transfer from {sender_addr}. Replying READY...\n")
                                             self._send_control_response(stream, ring_buffer, b"", TYPE_FORWARD_RESP)
+                                        else:
+                                            self.callback_log(f"[IGNORED] Router paged target {target_addr} (not us).\n")
                                     
+                                    # 2. Handle Data Chunks (Only process if explicitly paged)
                                     elif p_type in (TYPE_TEXT, TYPE_IMAGE, TYPE_FILE) and len(full_payload) >= 5:
+                                        if not self.is_paged:
+                                            # Ignore background traffic / origin-to-router uploads
+                                            state = "SEARCH_SYNC"
+                                            continue
+                                            
                                         p_type_data, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
                                         chunk_data = full_payload[5:]
                                         
@@ -495,12 +506,14 @@ class EndpointReceiverThread(threading.Thread):
                                                 reassembly_buffer.clear()
                                                 expected_seq = 0
                                                 active_transfer_type = None
+                                                self.is_paged = False  # Lock receiver again until next page
                                         elif seq_num < expected_seq:
                                             self._send_control_response(stream, ring_buffer, struct.pack('>H', seq_num), TYPE_ACK)
                                         else:
                                             self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
                                 else:
-                                    self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
+                                    if self.is_paged:
+                                        self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
                                     
                                 state = "SEARCH_SYNC"
                                 continue
