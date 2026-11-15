@@ -14,11 +14,11 @@ from PIL import Image
 # MODEM CONFIGURATION & CONSTANTS
 # ============================================================================
 SAMPLE_RATE = 44100
-SYMBOL_DURATION = 0.100  # 100 ms total per symbol
-TONE_DURATION = 0.080    # 80 ms tone + 20 ms guard silence
+SYMBOL_DURATION = 0.050  # 100 ms total per symbol
+TONE_DURATION = 0.040    # 80 ms tone + 20 ms guard silence
 SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
-WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)
-STEP_SAMPLES = int(SAMPLE_RATE * 0.010)
+WINDOW_SAMPLES = int(SAMPLE_RATE * 0.030)
+STEP_SAMPLES = int(SAMPLE_RATE * 0.005)
 CHUNK_SIZE = 32
 
 # Payload Type Identifiers
