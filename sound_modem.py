@@ -921,4 +921,4 @@ class ReceivePage(tk.Frame):
 
 if __name__ == "__main__":
     app = SoundModemApp()
-    app.mainloop()
+    app.mainloop() #latest
