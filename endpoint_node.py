@@ -194,19 +194,36 @@ def listen_for_response(expected_type, timeout=4.0):
         pass
     return False, None
 
-def perform_router_handshake(router_addr, my_addr, target_addr, callback_status):
-    callback_status("Initiating Handshake with Router...", "#f9e2af")
-    play_audio_waveform(struct.pack('>HH', router_addr, my_addr), TYPE_HS_REQ)
-    
-    success, resp_data = listen_for_response(TYPE_HS_RESP, timeout=5.0)
-    if not success or len(resp_data) < 4:
+def perform_router_handshake(router_addr, my_addr, target_addr, callback_status, max_retries=3):
+    # 1. Robust Handshake Request with Retries
+    success = False
+    resp_data = None
+    for attempt in range(1, max_retries + 1):
+        callback_status(f"Initiating Handshake (Attempt {attempt}/{max_retries})...", "#f9e2af")
+        play_audio_waveform(struct.pack('>HH', router_addr, my_addr), TYPE_HS_REQ)
+        
+        success, resp_data = listen_for_response(TYPE_HS_RESP, timeout=4.0)
+        if success and resp_data and len(resp_data) >= 4:
+            break
+        time.sleep(0.3)
+        
+    if not success or not resp_data or len(resp_data) < 4:
         callback_status("Handshake FAILED: No confirmation from Router.", "#f38ba8")
         return False
         
     callback_status("Handshake verified! Designating target...", "#f9e2af")
-    play_audio_waveform(struct.pack('>HH', router_addr, target_addr), TYPE_TARGET_REQ)
     
-    success_tgt, _ = listen_for_response(TYPE_TARGET_RESP, timeout=5.0)
+    # 2. Robust Target Designation Request with Retries
+    success_tgt = False
+    for attempt in range(1, max_retries + 1):
+        callback_status(f"Designating target (Attempt {attempt}/{max_retries})...", "#f9e2af")
+        play_audio_waveform(struct.pack('>HH', router_addr, target_addr), TYPE_TARGET_REQ)
+        
+        success_tgt, _ = listen_for_response(TYPE_TARGET_RESP, timeout=4.0)
+        if success_tgt:
+            break
+        time.sleep(0.3)
+        
     if not success_tgt:
         callback_status("Target Designation FAILED: Router did not acknowledge target.", "#f38ba8")
         return False
