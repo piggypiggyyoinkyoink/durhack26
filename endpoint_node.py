@@ -333,7 +333,8 @@ def perform_routed_upload(router_addr, my_addr, target_addr, data_payload, paylo
 
             callback_status("Upload SUCCESS! Waiting for router target delivery confirmation...", "#a6e3a1")
             
-            if _listen_response_stream(TYPE_FORWARD_FAIL, timeout=8.0, stream=stream, ring_buffer=ring_buffer):
+            # Match or exceed: guard_duration (3.5s) + (max_ping_retries * ~6s)
+            if _listen_response_stream(TYPE_FORWARD_FAIL, timeout=25.0, stream=stream, ring_buffer=ring_buffer):
                 callback_status("DELIVERY FAILED: Target was unreachable.", "#f38ba8")
                 return False
                 

@@ -279,10 +279,10 @@ class TkinterRouterThread(threading.Thread):
                     samples_until_next_read += SYMBOL_SAMPLES
         return None, None
 
-    def _guard_and_drain(self, stream, ring_buffer, total_pkts):
-        """1.5s post-upload settling window to re-ACK any retransmitted final packets."""
-        self.log_callback(f"[SETTLING] Entering 1.5s guard window to ensure Sender received final ACK...\n")
-        guard_end = time.time() + 1.5
+    def _guard_and_drain(self, stream, ring_buffer, total_pkts, guard_duration=3.5):
+        """Post-upload settling window to re-ACK any retransmitted final packets."""
+        self.log_callback(f"[SETTLING] Entering {guard_duration}s guard window to ensure Sender received final ACK...\n")
+        guard_end = time.time() + guard_duration
         expected_sync = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
         state = "SEARCH_SYNC"
         samples_until_next_read = 0
@@ -322,25 +322,36 @@ class TkinterRouterThread(threading.Thread):
                         full_payload = raw_bytes[2:-4]
                         received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
                         if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 5:
-                            p_type, seq_num, _ = struct.ops = struct.unpack('>BHH', full_payload[:5]) if len(full_payload) >= 5 else (0, 0, 0)
-                            # If sender re-sent the final packet because it missed the ACK, re-ACK it and extend guard window!
+                            p_type, seq_num, _ = struct.unpack('>BHH', full_payload[:5])
                             if seq_num == total_pkts - 1:
                                 self.log_callback(f"[SETTLING] Caught retransmitted final packet! Re-sending final ACK.\n")
                                 self._send_response(stream, ring_buffer, struct.pack('>H', total_pkts - 1), TYPE_ACK)
-                                guard_end = time.time() + 1.5  # Reset timer
+                                guard_end = time.time() + guard_duration  # Reset timer
                         state = "SEARCH_SYNC"
                     samples_until_next_read += SYMBOL_SAMPLES
 
-    def _page_and_forward_to_target(self, target_addr, sender_addr, payload_type, data, stream, ring_buffer):
-        self.log_callback(f"[ROUTER] Paging Target {target_addr}...\n")
+    def _page_and_forward_to_target(self, target_addr, sender_addr, payload_type, data, stream, ring_buffer, max_ping_retries=3):
         req_payload = struct.pack('>HH', target_addr, sender_addr)
-        self._send_response(stream, ring_buffer, req_payload, TYPE_FORWARD_REQ)
-        
-        target_ready = self._listen_for_specific_response(TYPE_FORWARD_RESP, timeout=5.0, stream=stream, ring_buffer=ring_buffer)
+        target_ready = False
+
+        for attempt in range(1, max_ping_retries + 1):
+            if not self.running:
+                return False
+            self.log_callback(f"[ROUTER] Paging Target {target_addr} (Attempt {attempt}/{max_ping_retries})...\n")
+            self._send_response(stream, ring_buffer, req_payload, TYPE_FORWARD_REQ)
+
+            if self._listen_for_specific_response(TYPE_FORWARD_RESP, timeout=5.0, stream=stream, ring_buffer=ring_buffer):
+                target_ready = True
+                break
+
+            if attempt < max_ping_retries:
+                self.log_callback(f"[ROUTER RETRY] No response from Target {target_addr}. Retrying ping...\n")
+                time.sleep(0.5)
+
         if not target_ready:
-            self.log_callback(f"[ROUTER TIMEOUT] Target {target_addr} did not respond to paging request.\n")
+            self.log_callback(f"[ROUTER TIMEOUT] Target {target_addr} did not respond after {max_ping_retries} attempts.\n")
             return False
-            
+
         self.log_callback(f"[ROUTER] Target {target_addr} ready! Forwarding data stream...\n")
         chunks = [data[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)] if len(data) > 0 else [b""]
         total_packets = len(chunks)
@@ -501,11 +512,12 @@ class TkinterRouterThread(threading.Thread):
                                                 self.data_callback(active_transfer_type, complete_data, self.active_sender, self.active_target)
                                                 
                                                 # --- GUARD WINDOW & SETTLING PHASE ---
-                                                self._guard_and_drain(stream, ring_buffer, total_pkts)
+                                                self._guard_and_drain(stream, ring_buffer, total_pkts, guard_duration=3.5)
                                                 
                                                 success = self._page_and_forward_to_target(
                                                     self.active_target, self.active_sender, 
-                                                    active_transfer_type, complete_data, stream, ring_buffer
+                                                    active_transfer_type, complete_data, stream, ring_buffer,
+                                                    max_ping_retries=3
                                                 )
                                                 if not success:
                                                     self._notify_sender_failure(self.active_sender, self.active_target, stream, ring_buffer)
