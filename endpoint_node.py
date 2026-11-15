@@ -330,14 +330,166 @@ def listen_for_ack_nak_local(timeout=4.0):
         pass
     return None, None
 
+
 # ============================================================================
-# END POINT GUI APPLICATION
+# CONTINUOUS BACKGROUND RECEIVER THREAD FOR ENDPOINTS
+# ============================================================================
+class EndpointReceiverThread(threading.Thread):
+    def __init__(self, callback_packet_received, callback_pixel_received, callback_log):
+        super().__init__()
+        self.daemon = True
+        self.callback_packet_received = callback_packet_received
+        self.callback_pixel_received = callback_pixel_received
+        self.callback_log = callback_log
+        self.running = False
+
+    def _send_control_response(self, stream, ring_buffer, seq_num, control_type):
+        time.sleep(0.3)
+        play_audio_waveform(struct.pack('>H', seq_num), control_type)
+        time.sleep(0.15)
+        while stream.read_available > 0:
+            stream.read(min(stream.read_available, STEP_SAMPLES))
+        ring_buffer.fill(0)
+
+    def run(self):
+        self.running = True
+        self.callback_log("[INFO] Endpoint listener active and waiting for incoming data...\n")
+        
+        ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
+        state = "SEARCH_SYNC"
+        samples_until_next_read = 0
+        nibbles = []
+        expected_nibbles = None
+        payload_len = 0
+        is_image_packet = False
+        current_seq_num = 0
+        
+        expected_seq = 0
+        reassembly_buffer = {}
+        active_transfer_type = None
+
+        expected_sync = [SYNC_FREQ_A, SYNC_FREQ_B] * 3
+        sync_armed = False
+        best_sync_snr = 0.0
+
+        try:
+            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
+                while self.running:
+                    audio, _ = stream.read(STEP_SAMPLES)
+                    ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
+                    ring_buffer[-STEP_SAMPLES:] = audio[:, 0]
+                    
+                    if state == "SEARCH_SYNC":
+                        detected_sync = []
+                        last_snr = 0.0
+                        for k in range(6):
+                            freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))])
+                            detected_sync.append(freq)
+                            if k == 5:
+                                last_snr = snr
+
+                        if detected_sync == expected_sync:
+                            if last_snr >= best_sync_snr:
+                                best_sync_snr = last_snr
+                                sync_armed = True
+                            elif sync_armed:
+                                state = "RECEIVE_DATA"
+                                nibbles = []
+                                expected_nibbles = None
+                                payload_len = 0
+                                is_image_packet = False
+                                current_seq_num = expected_seq
+                                sync_armed = False
+                                best_sync_snr = 0.0
+                                samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
+                        elif sync_armed:
+                            state = "RECEIVE_DATA"
+                            nibbles = []
+                            expected_nibbles = None
+                            payload_len = 0
+                            is_image_packet = False
+                            current_seq_num = expected_seq
+                            sync_armed = False
+                            best_sync_snr = 0.0
+                            samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
+                    elif state == "RECEIVE_DATA":
+                        samples_until_next_read -= STEP_SAMPLES
+                        if samples_until_next_read <= 0:
+                            _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.010) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.010)])
+                            nibbles.append(best_data_idx)
+                            current_nibble_count = len(nibbles)
+
+                            if current_nibble_count == 4:
+                                payload_len = struct.unpack('>H', decode_nibbles_to_bytes(nibbles[:4]))[0]
+                                expected_nibbles = (2 + payload_len + 4) * 2
+
+                            elif current_nibble_count == 14:
+                                header_bytes = decode_nibbles_to_bytes(nibbles[4:14])
+                                payload_type, seq_num, total_pkts = struct.unpack('>BHH', header_bytes)
+                                current_seq_num = seq_num if seq_num < total_pkts else expected_seq
+                                if payload_type == TYPE_IMAGE or active_transfer_type == TYPE_IMAGE:
+                                    is_image_packet = True
+
+                            elif (expected_nibbles is not None and 14 < current_nibble_count <= expected_nibbles - 8 and is_image_packet):
+                                nibble_in_chunk = current_nibble_count - 15
+                                pixel_idx = (current_seq_num * CHUNK_SIZE * 2) + nibble_in_chunk
+                                if pixel_idx < 256:
+                                    self.callback_pixel_received(pixel_idx // 16, pixel_idx % 16, best_data_idx)
+
+                            if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
+                                raw_bytes = decode_nibbles_to_bytes(nibbles)
+                                full_payload = raw_bytes[2:-4]
+                                received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
+                                
+                                if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 5:
+                                    p_type, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
+                                    chunk_data = full_payload[5:]
+                                    
+                                    if seq_num == 0 and expected_seq != 0:
+                                        reassembly_buffer.clear()
+                                        expected_seq = 0
+                                        active_transfer_type = p_type
+
+                                    if active_transfer_type is None:
+                                        active_transfer_type = p_type
+
+                                    if seq_num == expected_seq:
+                                        reassembly_buffer[seq_num] = chunk_data
+                                        self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
+                                        expected_seq += 1
+
+                                        if expected_seq == total_pkts:
+                                            complete_data = b"".join(reassembly_buffer[i] for i in range(total_pkts))
+                                            self.callback_packet_received(bytes([active_transfer_type]) + complete_data)
+                                            reassembly_buffer.clear()
+                                            expected_seq = 0
+                                            active_transfer_type = None
+                                    elif seq_num < expected_seq:
+                                        self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
+                                    else:
+                                        self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
+                                else:
+                                    self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
+                                    
+                                state = "SEARCH_SYNC"
+                                continue
+                                
+                            samples_until_next_read += SYMBOL_SAMPLES
+        except Exception as e:
+            self.callback_log(f"[INFO] Receiver stream stopped: {e}\n")
+
+    def stop(self):
+        self.running = False
+
+
+# ============================================================================
+# END POINT GUI APPLICATION WITH SEND & RECEIVE TABS
 # ============================================================================
 class EndpointApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Acoustic End Point Node")
-        self.geometry("950x720")
+        self.title("Acoustic End Point Node (Sender & Receiver)")
+        self.geometry("950x760")
         self.configure(bg="#1e1e2e")
 
         net_frame = tk.LabelFrame(self, text="Network Configuration", font=("Helvetica", 11, "bold"), bg="#1e1e2e", fg="#cdd6f4", padx=15, pady=10)
@@ -366,17 +518,20 @@ class EndpointApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=20, pady=10)
 
-        self.tab_text = tk.Frame(self.notebook, bg="#181825")
-        self.tab_file = tk.Frame(self.notebook, bg="#181825")
+        self.tab_send_text = tk.Frame(self.notebook, bg="#181825")
+        self.tab_send_file = tk.Frame(self.notebook, bg="#181825")
         self.tab_editor = tk.Frame(self.notebook, bg="#181825")
+        self.tab_receive = tk.Frame(self.notebook, bg="#181825")
 
-        self.notebook.add(self.tab_text, text="   1. Text Message   ")
-        self.notebook.add(self.tab_file, text="   2. Choose File   ")
+        self.notebook.add(self.tab_send_text, text="   1. Text Message   ")
+        self.notebook.add(self.tab_send_file, text="   2. Choose File   ")
         self.notebook.add(self.tab_editor, text="   3. 16x16 Pixel Editor   ")
+        self.notebook.add(self.tab_receive, text="   4. Listen / Receive Feed   ")
 
         self._build_text_tab()
         self._build_file_tab()
         self._build_editor_tab()
+        self._build_receive_tab()
 
         bottom = tk.Frame(self, bg="#181825", height=70)
         bottom.pack(fill="x", side="bottom")
@@ -391,15 +546,15 @@ class EndpointApp(tk.Tk):
         self.tx_btn.pack(side="right", padx=20, pady=10)
 
     def _build_text_tab(self):
-        tk.Label(self.tab_text, text="Enter UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
-        self.text_input = tk.Text(self.tab_text, height=10, font=("Courier", 12), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4")
+        tk.Label(self.tab_send_text, text="Enter UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
+        self.text_input = tk.Text(self.tab_send_text, height=10, font=("Courier", 12), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4")
         self.text_input.pack(fill="x", padx=20, pady=10)
         self.text_input.insert("1.0", "Hello through the central acoustic router!")
 
     def _build_file_tab(self):
         self.selected_file_path = None
         self.raw_file_bytes = None
-        frame = tk.Frame(self.tab_file, bg="#181825")
+        frame = tk.Frame(self.tab_send_file, bg="#181825")
         frame.pack(expand=True)
 
         tk.Button(frame, text="📁 Browse File...", font=("Helvetica", 12, "bold"), bg="#89b4fa", fg="#11111b", command=self.choose_file).pack(pady=10)
@@ -458,7 +613,6 @@ class EndpointApp(tk.Tk):
         self.active_color_lbl = tk.Label(tools_frame, text=f"Selected: Color #{self.current_color_idx}", font=("Helvetica", 9), bg="#181825", fg="#a6adc8")
         self.active_color_lbl.pack(pady=5)
 
-        # Restored Editor Feature Buttons[cite: 1]
         tk.Button(tools_frame, text="Fill Canvas with Selected", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=self.fill_canvas).pack(pady=3)
         tk.Button(tools_frame, text="Clear Canvas (Black)", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=lambda: self.fill_canvas(0)).pack(pady=3)
         tk.Button(tools_frame, text="Load Test Pattern", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=self.load_test_pattern).pack(pady=3)
@@ -467,6 +621,91 @@ class EndpointApp(tk.Tk):
             bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=22, pady=5, cursor="hand2",
             command=self.save_drawn_image
         ).pack(pady=(10, 3))
+
+    def _build_receive_tab(self):
+        self.is_listening = False
+        self.receiver_thread = None
+        self.rx_pixel_data = [[0 for _ in range(16)] for _ in range(16)]
+
+        main_body = tk.Frame(self.tab_receive, bg="#181825")
+        main_body.pack(fill="both", expand=True, padx=15, pady=15)
+
+        left_col = tk.Frame(main_body, bg="#181825")
+        left_col.pack(side="left", fill="y", padx=(0, 15))
+
+        tk.Label(left_col, text="Live Received Image", font=("Helvetica", 11, "bold"), bg="#181825", fg="#cdd6f4").pack(pady=(0, 5))
+        self.rx_cell_size = 20
+        self.rx_canvas = tk.Canvas(left_col, width=320, height=320, bg="#000000", highlightthickness=2, highlightbackground="#585b70")
+        self.rx_canvas.pack()
+
+        self.rx_rects = [[None for _ in range(16)] for _ in range(16)]
+        for r in range(16):
+            for c in range(16):
+                self.rx_rects[r][c] = self.rx_canvas.create_rectangle(c*20, r*20, (c+1)*20, (r+1)*20, fill="#000000", outline="#11111b")
+
+        right_col = tk.Frame(main_body, bg="#181825")
+        right_col.pack(side="left", fill="both", expand=True)
+
+        self.listen_btn = tk.Button(
+            right_col, text="🎙️ START LISTENING FOR DATA", font=("Helvetica", 12, "bold"),
+            bg="#a6e3a1", fg="#11111b", padx=15, pady=8, cursor="hand2", command=self.toggle_listening
+        )
+        self.listen_btn.pack(fill="x", pady=(0, 10))
+
+        tk.Label(right_col, text="Incoming Packet Log & Decoded Text:", font=("Helvetica", 11, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w")
+        self.rx_text_box = tk.Text(right_col, height=14, font=("Courier", 10), bg="#313244", fg="#cdd6f4", relief="flat")
+        self.rx_text_box.pack(fill="both", expand=True, pady=(5, 0))
+
+    def toggle_listening(self):
+        self.is_listening = not self.is_listening
+        if self.is_listening:
+            self.listen_btn.config(text="⏹️ STOP LISTENING", bg="#f38ba8")
+            self.receiver_thread = EndpointReceiverThread(
+                callback_packet_received=self.on_packet_received,
+                callback_pixel_received=self.update_rx_pixel_safely,
+                callback_log=self.append_log
+            )
+            self.receiver_thread.start()
+        else:
+            self.listen_btn.config(text="🎙️ START LISTENING FOR DATA", bg="#a6e3a1")
+            if self.receiver_thread:
+                self.receiver_thread.stop()
+            self.append_log("[INFO] Stopped listening.\n")
+
+    def append_log(self, text):
+        def _update():
+            self.rx_text_box.insert("end", text)
+            self.rx_text_box.see("end")
+        self.after(0, _update)
+
+    def update_rx_pixel_safely(self, row, col, color_idx):
+        def _paint():
+            if 0 <= row < 16 and 0 <= col < 16 and 0 <= color_idx < 16:
+                self.rx_pixel_data[row][col] = color_idx
+                self.rx_canvas.itemconfig(self.rx_rects[row][col], fill=PALETTE[color_idx])
+        self.after(0, _paint)
+
+    def on_packet_received(self, full_payload):
+        def _handle():
+            payload_type = full_payload[0]
+            actual_data = full_payload[1:]
+
+            if payload_type == TYPE_IMAGE:
+                self.append_log(f"[SUCCESS] 16x16 Image successfully received and reassembled!\n\n")
+            elif payload_type == TYPE_TEXT:
+                try:
+                    text_msg = actual_data.decode("utf-8")
+                    self.append_log(f"Decoded Message:\n{text_msg}\n[SUCCESS] Message verified.\n\n")
+                except UnicodeDecodeError:
+                    self.append_log(f"[ERROR] Text payload contained invalid UTF-8 bytes.\n")
+            elif payload_type == TYPE_FILE:
+                self.append_log(f"Received binary file ({len(actual_data)} bytes). Saving to ./received/...\n")
+                os.makedirs("received", exist_ok=True)
+                filepath = os.path.join("received", datetime.now().strftime("received_%Y%m%d_%H%M%S.bin"))
+                with open(filepath, "wb") as f:
+                    f.write(actual_data)
+                self.append_log(f"Saved to {filepath}\n\n")
+        self.after(0, _handle)
 
     def select_color(self, idx):
         self.current_color_idx = idx
@@ -480,14 +719,10 @@ class EndpointApp(tk.Tk):
             self.canvas.itemconfig(self.rect_ids[r][c], fill=PALETTE[color_idx])
 
     def _paint_event(self, event):
-        c = event.x // self.cell_size
-        r = event.y // self.cell_size
-        self.set_grid_pixel(r, c, self.current_color_idx)
+        self.set_grid_pixel(event.y // self.cell_size, event.x // self.cell_size, self.current_color_idx)
 
     def _erase_event(self, event):
-        c = event.x // self.cell_size
-        r = event.y // self.cell_size
-        self.set_grid_pixel(r, c, 0)
+        self.set_grid_pixel(event.y // self.cell_size, event.x // self.cell_size, 0)
 
     def fill_canvas(self, color_idx=None):
         idx = self.current_color_idx if color_idx is None else color_idx
@@ -502,29 +737,20 @@ class EndpointApp(tk.Tk):
 
     def save_drawn_image(self):
         file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png"), ("All files", "*.*")])
-        if not file_path:
-            return
+        if not file_path: return
         try:
             img = Image.new("RGB", (16, 16))
             for r in range(16):
                 for c in range(16):
-                    color_idx = self.pixel_data[r][c]
-                    rgb = hex_to_rgb(PALETTE[color_idx])
-                    img.putpixel((c, r), rgb)
-            img_scaled = img.resize((256, 256), Image.Resampling.NEAREST)
-            img_scaled.save(file_path)
-            messagebox.showinfo("Success", f"Image successfully saved to:\n{file_path}")
+                    img.putpixel((c, r), hex_to_rgb(PALETTE[self.pixel_data[r][c]]))
+            img.resize((256, 256), Image.Resampling.NEAREST).save(file_path)
+            messagebox.showinfo("Success", f"Image saved to:\n{file_path}")
         except Exception as e:
             messagebox.showerror("Error", f"Could not save image:\n{e}")
 
     def get_packed_canvas_bytes(self) -> bytes:
-        flat_nibbles = [self.pixel_data[r][c] for r in range(16) for c in range(16)]
-        packed = bytearray()
-        for i in range(0, len(flat_nibbles), 2):
-            high = flat_nibbles[i] & 0x0F
-            low = flat_nibbles[i + 1] & 0x0F
-            packed.append((high << 4) | low)
-        return bytes(packed)
+        flat = [self.pixel_data[r][c] for r in range(16) for c in range(16)]
+        return bytes([(flat[i] << 4) | (flat[i+1] & 0x0F) for i in range(0, len(flat), 2)])
 
     def update_status(self, text, color):
         def _set(): self.status_lbl.config(text=text, fg=color)
@@ -553,6 +779,7 @@ class EndpointApp(tk.Tk):
             payload = self.get_packed_canvas_bytes()
             payload_type = TYPE_IMAGE
         else:
+            messagebox.showinfo("Info", "Switch to a send tab (Text, File, or Editor) to transmit data.")
             return
 
         def _task():
