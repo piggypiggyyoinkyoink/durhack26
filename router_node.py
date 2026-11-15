@@ -115,7 +115,7 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes([int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8)])
 
 # ============================================================================
-# ROUTER THREAD WITH STORE-AND-FORWARD PAGING
+# ROUTER THREAD WITH STORE-AND-FORWARD PAGING (Robust 25ms Timing & Sync Arming)
 # ============================================================================
 class TkinterRouterThread(threading.Thread):
     def __init__(self, router_addr, log_callback, data_callback):
@@ -155,8 +155,7 @@ class TkinterRouterThread(threading.Thread):
                 detected_sync = []
                 last_snr = 0.0
                 for k in range(6):
-                    end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))
-                    freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
+                    freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
                     detected_sync.append(freq)
                     if k == 5:
                         last_snr = snr
@@ -182,7 +181,7 @@ class TkinterRouterThread(threading.Thread):
             elif state == "RECEIVE_DATA":
                 samples_until_next_read -= STEP_SAMPLES
                 if samples_until_next_read <= 0:
-                    _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.010) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.010)])
+                    _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
                     nibbles.append(best_data_idx)
                     current_nibble_count = len(nibbles)
 
@@ -222,8 +221,7 @@ class TkinterRouterThread(threading.Thread):
                 detected_sync = []
                 last_snr = 0.0
                 for k in range(6):
-                    end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))
-                    freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
+                    freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
                     detected_sync.append(freq)
                     if k == 5:
                         last_snr = snr
@@ -249,7 +247,7 @@ class TkinterRouterThread(threading.Thread):
             elif state == "RECEIVE_DATA":
                 samples_until_next_read -= STEP_SAMPLES
                 if samples_until_next_read <= 0:
-                    _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.010) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.010)])
+                    _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
                     nibbles.append(best_data_idx)
                     current_nibble_count = len(nibbles)
 
@@ -285,22 +283,25 @@ class TkinterRouterThread(threading.Thread):
         chunks = [data[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)] if len(data) > 0 else [b""]
         total_packets = len(chunks)
         seq_num = 0
+        retries = 0
 
         while seq_num < total_packets and self.running:
-            self._send_response(stream, ring_buffer, chunks[seq_num], payload_type) # Wait, forward packet with header
-            # Actually, use play_audio_waveform with proper sequence headers:
-            packet_bytes = build_packet(chunks[seq_num], payload_type, seq_num=seq_num, total_packets=total_packets)
-            # Let's send via play_audio_waveform:
             play_audio_waveform(chunks[seq_num], payload_type, seq_num=seq_num, total_packets=total_packets)
             time.sleep(0.3)
             
             ack_status, resp_seq = self._listen_for_ack_nak_internal(timeout=4.5, stream=stream, ring_buffer=ring_buffer)
             if ack_status == "ACK" and resp_seq == seq_num:
                 seq_num += 1
+                retries = 0
             elif ack_status == "NAK":
                 seq_num = resp_seq if (resp_seq is not None and 0 <= resp_seq < total_packets) else seq_num
+                retries += 1
+                if retries >= 3:
+                    return False
             else:
-                return False
+                retries += 1
+                if retries >= 3:
+                    return False
 
         self.log_callback(f"[ROUTER SUCCESS] Data successfully delivered to Target {target_addr}!\n")
         return True
@@ -338,8 +339,7 @@ class TkinterRouterThread(threading.Thread):
                         detected_sync = []
                         last_snr = 0.0
                         for k in range(6):
-                            end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))
-                            freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
+                            freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
                             detected_sync.append(freq)
                             if k == 5:
                                 last_snr = snr
@@ -365,7 +365,7 @@ class TkinterRouterThread(threading.Thread):
                     elif state == "RECEIVE_DATA":
                         samples_until_next_read -= STEP_SAMPLES
                         if samples_until_next_read <= 0:
-                            _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.010) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.010)])
+                            _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
                             nibbles.append(best_data_idx)
                             current_nibble_count = len(nibbles)
 
@@ -381,7 +381,6 @@ class TkinterRouterThread(threading.Thread):
                                 if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
                                     p_type = full_payload[0]
                                     
-                                    # Handshake
                                     if p_type == TYPE_HS_REQ and len(full_payload) >= 5:
                                         r_addr, s_addr = struct.unpack('>HH', full_payload[1:5])
                                         if r_addr == self.router_addr:
@@ -389,7 +388,6 @@ class TkinterRouterThread(threading.Thread):
                                             self.log_callback(f"[HANDSHAKE] Verified connection from Sender {s_addr}.\n")
                                             self._send_response(stream, ring_buffer, full_payload[1:5], TYPE_HS_RESP)
                                     
-                                    # Target Designation
                                     elif p_type == TYPE_TARGET_REQ and len(full_payload) >= 5:
                                         r_addr, t_addr = struct.unpack('>HH', full_payload[1:5])
                                         if r_addr == self.router_addr:
@@ -397,7 +395,6 @@ class TkinterRouterThread(threading.Thread):
                                             self.log_callback(f"[ROUTING] Target designated: {t_addr}.\n")
                                             self._send_response(stream, ring_buffer, full_payload[1:5], TYPE_TARGET_RESP)
 
-                                    # Data Packets Upload
                                     elif p_type in (TYPE_TEXT, TYPE_IMAGE, TYPE_FILE) and len(full_payload) >= 5:
                                         p_type_data, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
                                         chunk_data = full_payload[5:]
@@ -421,7 +418,6 @@ class TkinterRouterThread(threading.Thread):
                                                 self.log_callback(f"[UPLOAD COMPLETE] All packets gathered from {self.active_sender}. Initiating Target Paging...\n")
                                                 self.data_callback(active_transfer_type, complete_data, self.active_sender, self.active_target)
                                                 
-                                                # --- TRIGGER TARGET PAGING & FORWARDING ---
                                                 success = self._page_and_forward_to_target(
                                                     self.active_target, self.active_sender, 
                                                     active_transfer_type, complete_data, stream, ring_buffer

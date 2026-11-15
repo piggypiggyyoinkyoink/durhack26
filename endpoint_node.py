@@ -242,7 +242,7 @@ def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3
 
     callback_status(f"Upload SUCCESS! Waiting for router target delivery confirmation...", "#a6e3a1")
     
-    success_deliv, deliv_data = listen_for_response(TYPE_FORWARD_FAIL, timeout=8.0)
+    success_deliv, _ = listen_for_response(TYPE_FORWARD_FAIL, timeout=8.0)
     if success_deliv:
         callback_status("DELIVERY FAILED: Target was unreachable.", "#f38ba8")
         return False
@@ -324,7 +324,7 @@ def listen_for_ack_nak_local(timeout=4.0):
     return None, None
 
 # ============================================================================
-# ENDPOINT RECEIVER THREAD
+# ENDPOINT RECEIVER THREAD (Updated with robust 25ms offset & sync arming)
 # ============================================================================
 class EndpointReceiverThread(threading.Thread):
     def __init__(self, my_addr, callback_packet_received, callback_pixel_received, callback_log):
@@ -376,7 +376,7 @@ class EndpointReceiverThread(threading.Thread):
                         detected_sync = []
                         last_snr = 0.0
                         for k in range(6):
-                            freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.010))])
+                            freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
                             detected_sync.append(freq)
                             if k == 5:
                                 last_snr = snr
@@ -408,7 +408,7 @@ class EndpointReceiverThread(threading.Thread):
                     elif state == "RECEIVE_DATA":
                         samples_until_next_read -= STEP_SAMPLES
                         if samples_until_next_read <= 0:
-                            _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.010) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.010)])
+                            _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
                             nibbles.append(best_data_idx)
                             current_nibble_count = len(nibbles)
 
@@ -621,7 +621,6 @@ class EndpointApp(tk.Tk):
         tk.Button(tools_frame, text="Clear Canvas (Black)", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=lambda: self.fill_canvas(0)).pack(pady=3)
         tk.Button(tools_frame, text="Load Test Pattern", font=("Helvetica", 9, "bold"), highlightbackground="#181825", width=22, pady=4, cursor="hand2", command=self.load_test_pattern).pack(pady=3)
         
-        # --- NEW BUTTON: Load Saved Image into 16x16 Editor ---
         tk.Button(
             tools_frame, text="📁 Load Saved Image (.png)", font=("Helvetica", 9, "bold"),
             bg="#89b4fa", fg="#11111b", highlightbackground="#181825", width=22, pady=4, cursor="hand2",
@@ -756,7 +755,6 @@ class EndpointApp(tk.Tk):
                 self.set_grid_pixel(r, c, ((r // 4) * 4 + (c // 4)) % 16)
 
     def load_editor_image(self):
-        """Loads a saved upscaled PNG image back into the 16x16 grid."""
         file_path = filedialog.askopenfilename(title="Open Saved 16x16 Image", filetypes=[("PNG files", "*.png"), ("All files", "*.*")])
         if not file_path:
             return
