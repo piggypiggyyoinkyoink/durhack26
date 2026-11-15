@@ -76,20 +76,17 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     return wave
 
 def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
-    # Control and handshake packets bypass the data chunk sequence headers
     control_types = (
         TYPE_ACK, TYPE_NAK, 
         TYPE_HS_REQ, TYPE_HS_RESP, 
         TYPE_TARGET_REQ, TYPE_TARGET_RESP, 
         TYPE_FORWARD_REQ, TYPE_FORWARD_RESP, TYPE_FORWARD_FAIL
     )
-    
     if payload_type in control_types:
         full_payload = bytes([payload_type]) + data_payload
     else:
         header = struct.pack('>BHH', payload_type, seq_num, total_packets)
         full_payload = header + data_payload
-        
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
     return struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
 
@@ -123,9 +120,11 @@ def decode_nibbles_to_bytes(nibbles):
     bitstring = "".join(format(n, "04b") for n in nibbles)
     return bytes([int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8)])
 
-def listen_for_response(expected_type, timeout=4.0):
+# ============================================================================
+# PERSISTENT-STREAM SESSION LISTENERS (Eliminates stream startup latency)
+# ============================================================================
+def _listen_response_stream(expected_type, timeout, stream, ring_buffer):
     start_time = time.time()
-    ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
     state = "SEARCH_SYNC"
     samples_until_next_read = 0
     nibbles = []
@@ -134,151 +133,65 @@ def listen_for_response(expected_type, timeout=4.0):
     sync_armed = False
     best_sync_snr = 0.0
 
-    try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
-            while time.time() - start_time < timeout:
-                audio, _ = stream.read(STEP_SAMPLES)
-                ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
-                ring_buffer[-STEP_SAMPLES:] = audio[:, 0]
-                
-                if state == "SEARCH_SYNC":
-                    detected_sync = []
-                    last_snr = 0.0
-                    for k in range(6):
-                        freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
-                        detected_sync.append(freq)
-                        if k == 5:
-                            last_snr = snr
+    while time.time() - start_time < timeout:
+        audio, _ = stream.read(STEP_SAMPLES)
+        ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
+        ring_buffer[-STEP_SAMPLES:] = audio[:, 0]
+        
+        if state == "SEARCH_SYNC":
+            detected_sync = []
+            last_snr = 0.0
+            for k in range(6):
+                end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))
+                freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
+                detected_sync.append(freq)
+                if k == 5:
+                    last_snr = snr
 
-                    if detected_sync == expected_sync:
-                        if last_snr >= best_sync_snr:
-                            best_sync_snr = last_snr
-                            sync_armed = True
-                        elif sync_armed:
-                            state = "RECEIVE_DATA"
-                            nibbles = []
-                            expected_nibbles = None
-                            sync_armed = False
-                            best_sync_snr = 0.0
-                            samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
-                    elif sync_armed:
-                        state = "RECEIVE_DATA"
-                        nibbles = []
-                        expected_nibbles = None
-                        sync_armed = False
-                        best_sync_snr = 0.0
-                        samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
-                elif state == "RECEIVE_DATA":
-                    samples_until_next_read -= STEP_SAMPLES
-                    if samples_until_next_read <= 0:
-                        _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
-                        nibbles.append(best_data_idx)
-                        current_nibble_count = len(nibbles)
+            if detected_sync == expected_sync:
+                if last_snr >= best_sync_snr:
+                    best_sync_snr = last_snr
+                    sync_armed = True
+                elif sync_armed:
+                    state = "RECEIVE_DATA"
+                    nibbles = []
+                    expected_nibbles = None
+                    sync_armed = False
+                    best_sync_snr = 0.0
+                    samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
+            elif sync_armed:
+                state = "RECEIVE_DATA"
+                nibbles = []
+                expected_nibbles = None
+                sync_armed = False
+                best_sync_snr = 0.0
+                samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
+        elif state == "RECEIVE_DATA":
+            samples_until_next_read -= STEP_SAMPLES
+            if samples_until_next_read <= 0:
+                _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
+                nibbles.append(best_data_idx)
+                current_nibble_count = len(nibbles)
 
-                        if current_nibble_count == 4:
-                            payload_len = struct.unpack('>H', decode_nibbles_to_bytes(nibbles[:4]))[0]
-                            expected_nibbles = (2 + payload_len + 4) * 2
+                if current_nibble_count == 4:
+                    payload_len = struct.unpack('>H', decode_nibbles_to_bytes(nibbles[:4]))[0]
+                    expected_nibbles = (2 + payload_len + 4) * 2
 
-                        if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
-                            raw_bytes = decode_nibbles_to_bytes(nibbles)
-                            full_payload = raw_bytes[2:-4]
-                            received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
-                            
-                            if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
-                                p_type = full_payload[0]
-                                if p_type == expected_type:
-                                    return True, full_payload[1:]
-                            return False, None
-                        samples_until_next_read += SYMBOL_SAMPLES
-    except Exception:
-        pass
-    return False, None
+                if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
+                    raw_bytes = decode_nibbles_to_bytes(nibbles)
+                    full_payload = raw_bytes[2:-4]
+                    received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
+                    
+                    if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
+                        p_type = full_payload[0]
+                        if p_type == expected_type:
+                            return True
+                    return False
+                samples_until_next_read += SYMBOL_SAMPLES
+    return False
 
-def perform_router_handshake(router_addr, my_addr, target_addr, callback_status, max_retries=3):
-    # 1. Robust Handshake Request with Retries
-    success = False
-    resp_data = None
-    for attempt in range(1, max_retries + 1):
-        callback_status(f"Initiating Handshake (Attempt {attempt}/{max_retries})...", "#f9e2af")
-        play_audio_waveform(struct.pack('>HH', router_addr, my_addr), TYPE_HS_REQ)
-        
-        success, resp_data = listen_for_response(TYPE_HS_RESP, timeout=4.0)
-        if success and resp_data and len(resp_data) >= 4:
-            break
-        time.sleep(0.3)
-        
-    if not success or not resp_data or len(resp_data) < 4:
-        callback_status("Handshake FAILED: No confirmation from Router.", "#f38ba8")
-        return False
-        
-    callback_status("Handshake verified! Designating target...", "#f9e2af")
-    
-    # 2. Robust Target Designation Request with Retries
-    success_tgt = False
-    for attempt in range(1, max_retries + 1):
-        callback_status(f"Designating target (Attempt {attempt}/{max_retries})...", "#f9e2af")
-        play_audio_waveform(struct.pack('>HH', router_addr, target_addr), TYPE_TARGET_REQ)
-        
-        success_tgt, _ = listen_for_response(TYPE_TARGET_RESP, timeout=4.0)
-        if success_tgt:
-            break
-        time.sleep(0.3)
-        
-    if not success_tgt:
-        callback_status("Target Designation FAILED: Router did not acknowledge target.", "#f38ba8")
-        return False
-        
-    callback_status("Router ready! Uploading data...", "#a6e3a1")
-    return True
-
-def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3):
-    chunks = [data_payload[i:i + CHUNK_SIZE] for i in range(0, len(data_payload), CHUNK_SIZE)] if len(data_payload) > 0 else [b""]
-    total_packets = len(chunks)
-    seq_num = 0
-    retries = 0
-
-    while seq_num < total_packets:
-        pkt_label = f"Packet {seq_num + 1}/{total_packets}"
-        callback_status(f"Uploading {pkt_label}...", "#89b4fa")
-        
-        try:
-            play_audio_waveform(chunks[seq_num], payload_type, seq_num=seq_num, total_packets=total_packets)
-        except Exception as e:
-            callback_status(f"Transmission error: {e}", "#f38ba8")
-            return False
-        
-        time.sleep(0.3)
-        response, resp_seq = listen_for_ack_nak_local(timeout=4.5)
-        
-        if response == "ACK" and resp_seq == seq_num:
-            seq_num += 1
-            retries = 0
-        elif response == "NAK":
-            target = resp_seq if (resp_seq is not None and 0 <= resp_seq < total_packets) else seq_num
-            retries += 1
-            if retries >= max_retries:
-                callback_status(f"FAILED: Max retries exceeded on {pkt_label}", "#f38ba8")
-                return False
-            seq_num = target
-        else:
-            retries += 1
-            if retries >= max_retries:
-                callback_status(f"FAILED: Timeout on {pkt_label}", "#f38ba8")
-                return False
-
-    callback_status(f"Upload SUCCESS! Waiting for router target delivery confirmation...", "#a6e3a1")
-    
-    success_deliv, _ = listen_for_response(TYPE_FORWARD_FAIL, timeout=8.0)
-    if success_deliv:
-        callback_status("DELIVERY FAILED: Target was unreachable.", "#f38ba8")
-        return False
-        
-    callback_status("Delivery CONFIRMED by Router!", "#a6e3a1")
-    return True
-
-def listen_for_ack_nak_local(timeout=4.0):
+def _listen_ack_nak_stream(timeout, stream, ring_buffer):
     start_time = time.time()
-    ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
     state = "SEARCH_SYNC"
     samples_until_next_read = 0
     nibbles = []
@@ -287,70 +200,152 @@ def listen_for_ack_nak_local(timeout=4.0):
     sync_armed = False
     best_sync_snr = 0.0
 
-    try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
-            while time.time() - start_time < timeout:
-                audio, _ = stream.read(STEP_SAMPLES)
-                ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
-                ring_buffer[-STEP_SAMPLES:] = audio[:, 0]
-                
-                if state == "SEARCH_SYNC":
-                    detected_sync = []
-                    last_snr = 0.0
-                    for k in range(6):
-                        freq, snr, _ = analyze_window(ring_buffer[-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025)) - WINDOW_SAMPLES:-((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))])
-                        detected_sync.append(freq)
-                        if k == 5:
-                            last_snr = snr
+    while time.time() - start_time < timeout:
+        audio, _ = stream.read(STEP_SAMPLES)
+        ring_buffer = np.roll(ring_buffer, -STEP_SAMPLES)
+        ring_buffer[-STEP_SAMPLES:] = audio[:, 0]
+        
+        if state == "SEARCH_SYNC":
+            detected_sync = []
+            last_snr = 0.0
+            for k in range(6):
+                end_offset = -((5 - k) * SYMBOL_SAMPLES + int(SAMPLE_RATE * 0.025))
+                freq, snr, _ = analyze_window(ring_buffer[end_offset - WINDOW_SAMPLES:end_offset])
+                detected_sync.append(freq)
+                if k == 5:
+                    last_snr = snr
 
-                    if detected_sync == expected_sync:
-                        if last_snr >= best_sync_snr:
-                            best_sync_snr = last_snr
-                            sync_armed = True
-                        elif sync_armed:
-                            state = "RECEIVE_DATA"
-                            nibbles = []
-                            expected_nibbles = None
-                            sync_armed = False
-                            best_sync_snr = 0.0
-                            samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
-                    elif sync_armed:
-                        state = "RECEIVE_DATA"
-                        nibbles = []
-                        expected_nibbles = None
-                        sync_armed = False
-                        best_sync_snr = 0.0
-                        samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
-                elif state == "RECEIVE_DATA":
-                    samples_until_next_read -= STEP_SAMPLES
-                    if samples_until_next_read <= 0:
-                        _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
-                        nibbles.append(best_data_idx)
-                        current_nibble_count = len(nibbles)
+            if detected_sync == expected_sync:
+                if last_snr >= best_sync_snr:
+                    best_sync_snr = last_snr
+                    sync_armed = True
+                elif sync_armed:
+                    state = "RECEIVE_DATA"
+                    nibbles = []
+                    expected_nibbles = None
+                    sync_armed = False
+                    best_sync_snr = 0.0
+                    samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES
+            elif sync_armed:
+                state = "RECEIVE_DATA"
+                nibbles = []
+                expected_nibbles = None
+                sync_armed = False
+                best_sync_snr = 0.0
+                samples_until_next_read = SYMBOL_SAMPLES - STEP_SAMPLES         
+        elif state == "RECEIVE_DATA":
+            samples_until_next_read -= STEP_SAMPLES
+            if samples_until_next_read <= 0:
+                _, _, best_data_idx = analyze_window(ring_buffer[-int(SAMPLE_RATE * 0.025) - WINDOW_SAMPLES:-int(SAMPLE_RATE * 0.025)])
+                nibbles.append(best_data_idx)
+                current_nibble_count = len(nibbles)
 
-                        if current_nibble_count == 4:
-                            payload_len = struct.unpack('>H', decode_nibbles_to_bytes(nibbles[:4]))[0]
-                            expected_nibbles = (2 + payload_len + 4) * 2
+                if current_nibble_count == 4:
+                    payload_len = struct.unpack('>H', decode_nibbles_to_bytes(nibbles[:4]))[0]
+                    expected_nibbles = (2 + payload_len + 4) * 2
 
-                        if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
-                            raw_bytes = decode_nibbles_to_bytes(nibbles)
-                            full_payload = raw_bytes[2:-4]
-                            received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
-                            if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 3:
-                                p_type = full_payload[0]
-                                target_seq = struct.unpack('>H', full_payload[1:3])[0]
-                                if p_type == TYPE_ACK:
-                                    return "ACK", target_seq
-                                elif p_type == TYPE_NAK:
-                                    return "NAK", target_seq
-                            return None, None
-                        samples_until_next_read += SYMBOL_SAMPLES
-    except Exception:
-        pass
+                if expected_nibbles is not None and current_nibble_count >= expected_nibbles:
+                    raw_bytes = decode_nibbles_to_bytes(nibbles)
+                    full_payload = raw_bytes[2:-4]
+                    received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
+                    if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 3:
+                        p_type = full_payload[0]
+                        target_seq = struct.unpack('>H', full_payload[1:3])[0]
+                        if p_type == TYPE_ACK:
+                            return "ACK", target_seq
+                        elif p_type == TYPE_NAK:
+                            return "NAK", target_seq
+                    return None, None
+                samples_until_next_read += SYMBOL_SAMPLES
     return None, None
 
+def perform_routed_upload(router_addr, my_addr, target_addr, data_payload, payload_type, callback_status, max_retries=3):
+    ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
+    
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=STEP_SAMPLES) as stream:
+            
+            # --- 1. HANDSHAKE ---
+            callback_status("Initiating Handshake with Router...", "#f9e2af")
+            hs_success = False
+            for attempt in range(1, max_retries + 1):
+                play_audio_waveform(struct.pack('>HH', router_addr, my_addr), TYPE_HS_REQ)
+                time.sleep(0.1)
+                if _listen_response_stream(TYPE_HS_RESP, timeout=4.5, stream=stream, ring_buffer=ring_buffer):
+                    hs_success = True
+                    break
+                callback_status(f"Handshake retry {attempt}/{max_retries}...", "#f9e2af")
+                time.sleep(0.3)
+            
+            if not hs_success:
+                callback_status("Handshake FAILED: No confirmation from Router.", "#f38ba8")
+                return False
+            
+            # --- 2. TARGET DESIGNATION ---
+            callback_status("Handshake verified! Designating target...", "#f9e2af")
+            tgt_success = False
+            for attempt in range(1, max_retries + 1):
+                play_audio_waveform(struct.pack('>HH', router_addr, target_addr), TYPE_TARGET_REQ)
+                time.sleep(0.1)
+                if _listen_response_stream(TYPE_TARGET_RESP, timeout=4.5, stream=stream, ring_buffer=ring_buffer):
+                    tgt_success = True
+                    break
+                callback_status(f"Target designation retry {attempt}/{max_retries}...", "#f9e2af")
+                time.sleep(0.3)
+                
+            if not tgt_success:
+                callback_status("Target Designation FAILED: Router did not acknowledge target.", "#f38ba8")
+                return False
+            
+            # --- 3. CHUNKED UPLOAD WITH ARQ ---
+            callback_status("Router ready! Uploading data with ARQ...", "#a6e3a1")
+            chunks = [data_payload[i:i + CHUNK_SIZE] for i in range(0, len(data_payload), CHUNK_SIZE)] if len(data_payload) > 0 else [b""]
+            total_packets = len(chunks)
+            seq_num = 0
+            retries = 0
+
+            while seq_num < total_packets:
+                pkt_label = f"Packet {seq_num + 1}/{total_packets}"
+                callback_status(f"Uploading {pkt_label}...", "#89b4fa")
+                
+                play_audio_waveform(chunks[seq_num], payload_type, seq_num=seq_num, total_packets=total_packets)
+                time.sleep(0.2)
+                
+                response, resp_seq = _listen_ack_nak_stream(timeout=4.5, stream=stream, ring_buffer=ring_buffer)
+                
+                if response == "ACK" and resp_seq == seq_num:
+                    seq_num += 1
+                    retries = 0
+                elif response == "NAK":
+                    target = resp_seq if (resp_seq is not None and 0 <= resp_seq < total_packets) else seq_num
+                    retries += 1
+                    callback_status(f"NAK received for seq {seq_num+1}. Retrying...", "#f9e2af")
+                    if retries >= max_retries:
+                        callback_status(f"FAILED: Max retries exceeded on {pkt_label}", "#f38ba8")
+                        return False
+                    seq_num = target
+                else:
+                    retries += 1
+                    callback_status(f"Timeout on {pkt_label} (Attempt {retries}/{max_retries})...", "#f9e2af")
+                    if retries >= max_retries:
+                        callback_status(f"FAILED: Timeout on {pkt_label}", "#f38ba8")
+                        return False
+
+            callback_status("Upload SUCCESS! Waiting for router target delivery confirmation...", "#a6e3a1")
+            
+            if _listen_response_stream(TYPE_FORWARD_FAIL, timeout=8.0, stream=stream, ring_buffer=ring_buffer):
+                callback_status("DELIVERY FAILED: Target was unreachable.", "#f38ba8")
+                return False
+                
+            callback_status("Delivery CONFIRMED by Router!", "#a6e3a1")
+            return True
+
+    except Exception as e:
+            callback_status(f"Transmission session error: {e}", "#f38ba8")
+            return False
+
 # ============================================================================
-# ENDPOINT RECEIVER THREAD (Updated with robust 25ms offset & sync arming)
+# ENDPOINT RECEIVER THREAD
 # ============================================================================
 class EndpointReceiverThread(threading.Thread):
     def __init__(self, my_addr, callback_packet_received, callback_pixel_received, callback_log):
@@ -361,7 +356,7 @@ class EndpointReceiverThread(threading.Thread):
         self.callback_pixel_received = callback_pixel_received
         self.callback_log = callback_log
         self.running = False
-        self.is_paged = False  # Gatekeeper flag: ignore traffic until paged by router
+        self.is_paged = False
 
     def _send_control_response(self, stream, ring_buffer, payload, control_type):
         time.sleep(0.3)
@@ -467,20 +462,17 @@ class EndpointReceiverThread(threading.Thread):
                                 if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
                                     p_type = full_payload[0]
                                     
-                                    # 1. Handle Paging Request from Router
                                     if p_type == TYPE_FORWARD_REQ and len(full_payload) >= 5:
                                         target_addr, sender_addr = struct.unpack('>HH', full_payload[1:5])
                                         if target_addr == self.my_addr:
-                                            self.is_paged = True  # Unlock receiver for this session
+                                            self.is_paged = True
                                             self.callback_log(f"[PAGED] Router called our address! Incoming transfer from {sender_addr}. Replying READY...\n")
                                             self._send_control_response(stream, ring_buffer, b"", TYPE_FORWARD_RESP)
                                         else:
                                             self.callback_log(f"[IGNORED] Router paged target {target_addr} (not us).\n")
                                     
-                                    # 2. Handle Data Chunks (Only process if explicitly paged)
                                     elif p_type in (TYPE_TEXT, TYPE_IMAGE, TYPE_FILE) and len(full_payload) >= 5:
                                         if not self.is_paged:
-                                            # Ignore background traffic / origin-to-router uploads
                                             state = "SEARCH_SYNC"
                                             continue
                                             
@@ -506,7 +498,7 @@ class EndpointReceiverThread(threading.Thread):
                                                 reassembly_buffer.clear()
                                                 expected_seq = 0
                                                 active_transfer_type = None
-                                                self.is_paged = False  # Lock receiver again until next page
+                                                self.is_paged = False
                                         elif seq_num < expected_seq:
                                             self._send_control_response(stream, ring_buffer, struct.pack('>H', seq_num), TYPE_ACK)
                                         else:
@@ -860,9 +852,10 @@ class EndpointApp(tk.Tk):
             return
 
         def _task():
-            success = perform_router_handshake(router_addr, my_addr, target_addr, self.update_status)
-            if success:
-                transmit_with_arq(payload, payload_type, self.update_status)
+            perform_routed_upload(
+                router_addr, my_addr, target_addr, 
+                payload, payload_type, self.update_status
+            )
 
         threading.Thread(target=_task, daemon=True).start()
 
