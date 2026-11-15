@@ -6,18 +6,22 @@ import os
 from datetime import datetime
 import numpy as np
 import sounddevice as sd
-import ipywidgets as widgets
-from IPython.display import display, clear_output
-from PIL import Image
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
 
+# ============================================================================
+# MODEM CONFIGURATION & CONSTANTS
+# ============================================================================
 SAMPLE_RATE = 44100
-SYMBOL_DURATION = 0.100
-TONE_DURATION = 0.080
+SYMBOL_DURATION = 0.100  # 100 ms total per symbol
+TONE_DURATION = 0.080    # 80 ms tone + 20 ms guard silence
 SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
 WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)
 STEP_SAMPLES = int(SAMPLE_RATE * 0.010)
 CHUNK_SIZE = 32
 
+# Payload Type Identifiers
 TYPE_TEXT = 0x01
 TYPE_IMAGE = 0x02
 TYPE_FILE = 0x03
@@ -50,16 +54,19 @@ def hex_to_rgb(hex_str):
     hex_str = hex_str.lstrip('#')
     return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
 
-PALETTE_RGB = [hex_to_rgb(c) for c in PALETTE]
-
+# ============================================================================
+# ENCODER & ACOUSTIC FUNCTIONS
+# ============================================================================
 def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, amplitude=0.8):
     tone_samples = int(sample_rate * duration)
     total_samples = int(sample_rate * total_slot_duration)
     t = np.linspace(0, duration, tone_samples, endpoint=False)
     fade_len = int(sample_rate * 0.005)
+    
     envelope = np.ones(tone_samples)
     envelope[:fade_len] = np.linspace(0, 1, fade_len)
     envelope[-fade_len:] = np.linspace(1, 0, fade_len)
+    
     wave = amplitude * np.sin(2 * np.pi * freq * t) * envelope
     if (total_samples - tone_samples) > 0:
         wave = np.pad(wave, (0, total_samples - tone_samples), mode='constant')
@@ -77,6 +84,7 @@ def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
 def play_audio_waveform(data_payload, payload_type, seq_num=0, total_packets=1):
     packet = build_packet(data_payload, payload_type, seq_num, total_packets)
     bitstring = "".join(f"{byte:08b}" for byte in packet)
+    
     waves = []
     for freq in [SYNC_FREQ_A, SYNC_FREQ_B] * 3:
         waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
@@ -84,6 +92,7 @@ def play_audio_waveform(data_payload, payload_type, seq_num=0, total_packets=1):
         waves.append(generate_tone(DATA_FREQS[int(bitstring[i:i+4], 2)], TONE_DURATION, SYMBOL_DURATION))
     waves.append(generate_tone(SYNC_FREQ_A, TONE_DURATION, SYMBOL_DURATION))
     waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
+    
     sd.play(np.concatenate(waves).astype(np.float32), samplerate=SAMPLE_RATE)
     sd.wait()
 
@@ -102,7 +111,10 @@ def decode_nibbles_to_bytes(nibbles):
     bitstring = "".join(format(n, "04b") for n in nibbles)
     return bytes([int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8)])
 
-class JupyterRouterThread(threading.Thread):
+# ============================================================================
+# ROUTER LISTENER THREAD
+# ============================================================================
+class TkinterRouterThread(threading.Thread):
     def __init__(self, router_addr, log_callback, data_callback):
         super().__init__()
         self.daemon = True
@@ -123,7 +135,7 @@ class JupyterRouterThread(threading.Thread):
 
     def run(self):
         self.running = True
-        self.log_callback(f"[ROUTER START] Listening on Router Address: {self.router_addr}")
+        self.log_callback(f"[ROUTER START] Listening on Router Address: {self.router_addr}\n")
         
         ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
         state = "SEARCH_SYNC"
@@ -197,7 +209,7 @@ class JupyterRouterThread(threading.Thread):
                                         r_addr, s_addr = struct.unpack('>HH', full_payload[1:5])
                                         if r_addr == self.router_addr:
                                             self.active_sender = s_addr
-                                            self.log_callback(f"[HANDSHAKE] Verified connection from Sender {s_addr}. Repeating confirmation...")
+                                            self.log_callback(f"[HANDSHAKE] Verified connection from Sender {s_addr}. Repeating confirmation...\n")
                                             self._send_response(stream, ring_buffer, full_payload[1:5], TYPE_HS_RESP)
                                     
                                     # Target Designation
@@ -205,7 +217,7 @@ class JupyterRouterThread(threading.Thread):
                                         r_addr, t_addr = struct.unpack('>HH', full_payload[1:5])
                                         if r_addr == self.router_addr:
                                             self.active_target = t_addr
-                                            self.log_callback(f"[ROUTING] Target designated: {t_addr}. Acknowledging...")
+                                            self.log_callback(f"[ROUTING] Target designated: {t_addr}. Acknowledging...\n")
                                             self._send_response(stream, ring_buffer, full_payload[1:5], TYPE_TARGET_RESP)
 
                                     # Data Packets (Text, Image, File)
@@ -223,13 +235,13 @@ class JupyterRouterThread(threading.Thread):
 
                                         if seq_num == expected_seq:
                                             reassembly_buffer[seq_num] = chunk_data
-                                            self.log_callback(f"[ROUTER RX] Packet {seq_num + 1}/{total_pkts} received from {self.active_sender}. Sending ACK.")
+                                            self.log_callback(f"[ROUTER RX] Packet {seq_num + 1}/{total_pkts} received from {self.active_sender}. Sending ACK.\n")
                                             self._send_response(stream, ring_buffer, struct.pack('>H', seq_num), TYPE_ACK)
                                             expected_seq += 1
 
                                             if expected_seq == total_pkts:
                                                 complete_data = b"".join(reassembly_buffer[i] for i in range(total_pkts))
-                                                self.log_callback(f"[ROUTER SUCCESS] All packets gathered from {self.active_sender} for target {self.active_target}!")
+                                                self.log_callback(f"[ROUTER SUCCESS] All packets gathered from {self.active_sender} for target {self.active_target}!\n")
                                                 self.data_callback(active_transfer_type, complete_data, self.active_sender, self.active_target)
                                                 
                                                 reassembly_buffer.clear()
@@ -244,79 +256,144 @@ class JupyterRouterThread(threading.Thread):
                                 continue
                             samples_until_next_read += SYMBOL_SAMPLES
         except Exception as e:
-            self.log_callback(f"[ROUTER ERROR] {e}")
+            self.log_callback(f"[ROUTER ERROR] {e}\n")
 
     def stop(self):
         self.running = False
 
-# --- Jupyter ipywidgets Dashboard ---
-router_id_input = widgets.IntText(value=999, description='Router ID:')
-toggle_btn = widgets.Button(description='🚀 Start Router', button_style='success')
-status_label = widgets.HTML(value='<b>Status:</b> Offline')
+# ============================================================================
+# ROUTER GUI APPLICATION
+# ============================================================================
+class RouterApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Acoustic Central Router Node")
+        self.geometry("900x750")
+        self.configure(bg="#1e1e2e")
 
-log_output = widgets.Output(layout={'border': '1px solid #ccc', 'height': '180px', 'overflow_y': 'scroll', 'background-color': '#1e1e2e', 'color': '#cdd6f4'})
-data_output = widgets.Output(layout={'border': '1px solid #ccc', 'height': '280px', 'overflow_y': 'scroll', 'padding': '10px'})
+        # Top Control Frame
+        top_frame = tk.LabelFrame(self, text="Router Configuration", font=("Helvetica", 11, "bold"), bg="#1e1e2e", fg="#cdd6f4", padx=15, pady=10)
+        top_frame.pack(fill="x", padx=20, pady=10)
 
-router_thread = None
+        tk.Label(top_frame, text="Router ID:", bg="#1e1e2e", fg="#a6adc8").grid(row=0, column=0, sticky="w")
+        self.router_id_entry = tk.Entry(top_frame, width=8, bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4")
+        self.router_id_entry.insert(0, "999")
+        self.router_id_entry.grid(row=0, column=1, padx=5)
 
-def log_msg(msg):
-    with log_output:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+        self.toggle_btn = tk.Button(
+            top_frame, text="🚀 Start Router", font=("Helvetica", 11, "bold"),
+            bg="#a6e3a1", fg="#11111b", padx=12, pady=4, cursor="hand2", command=self.toggle_router
+        )
+        self.toggle_btn.grid(row=0, column=2, padx=20)
 
-def display_received_data(p_type, data, sender, target):
-    with data_output:
-        clear_output(wait=True)
-        print(f"--- Stored Data Ready to Forward (From: {sender} -> Target: {target}) ---")
-        if p_type == TYPE_TEXT:
+        self.status_lbl = tk.Label(top_frame, text="Status: Offline", font=("Helvetica", 11, "bold"), bg="#1e1e2e", fg="#f38ba8")
+        self.status_lbl.grid(row=0, column=3, padx=10)
+
+        # Main Split Body
+        body_frame = tk.Frame(self, bg="#1e1e2e")
+        body_frame.pack(fill="both", expand=True, padx=20, pady=5)
+
+        # Left: Live Event Log
+        left_sub = tk.Frame(body_frame, bg="#1e1e2e")
+        left_sub.pack(side="top", fill="both", expand=True, pady=(0, 10))
+
+        tk.Label(left_sub, text="Live Router Event Log:", font=("Helvetica", 11, "bold"), bg="#1e1e2e", fg="#cdd6f4").pack(anchor="w")
+        self.log_box = tk.Text(left_sub, height=12, font=("Courier", 10), bg="#313244", fg="#cdd6f4", relief="flat")
+        self.log_box.pack(fill="both", expand=True, pady=(5, 0))
+
+        # Right: Reassembled Stored Data Preview
+        right_sub = tk.Frame(body_frame, bg="#1e1e2e")
+        right_sub.pack(side="bottom", fill="both", expand=True)
+
+        tk.Label(right_sub, text="Stored Data / Reassembled Payload Preview:", font=("Helvetica", 11, "bold"), bg="#1e1e2e", fg="#cdd6f4").pack(anchor="w")
+        
+        data_container = tk.Frame(right_sub, bg="#313244", bd=1, relief="solid")
+        data_container.pack(fill="both", expand=True, pady=(5, 0))
+
+        self.preview_canvas = tk.Canvas(data_container, width=200, height=200, bg="#000000", highlightthickness=0)
+        self.preview_canvas.pack(side="left", padx=15, pady=15)
+        
+        # 16x16 Rects for Image Preview
+        self.preview_rects = [[None for _ in range(16)] for _ in range(16)]
+        for r in range(16):
+            for c in range(16):
+                self.preview_rects[r][c] = self.preview_canvas.create_rectangle(c*12, r*12, (c+1)*12, (r+1)*12, fill="#000000", outline="#1e1e2e")
+
+        self.data_text_box = tk.Text(data_container, font=("Courier", 11), bg="#313244", fg="#a6e3a1", relief="flat", wrap="word")
+        self.data_text_box.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+        self.router_thread = None
+        self.is_running = False
+
+    def log_msg(self, msg):
+        def _update():
+            self.log_box.insert("end", msg)
+            self.log_box.see("end")
+        self.after(0, _update)
+
+    def display_received_data(self, p_type, data, sender, target):
+        def _render():
+            self.data_text_box.delete("1.0", "end")
+            header_str = f"--- Stored Data Ready to Forward (From: {sender} -> Target: {target}) ---\n\n"
+            self.data_text_box.insert("end", header_str)
+
+            # Clear preview canvas
+            for r in range(16):
+                for c in range(16):
+                    self.preview_canvas.itemconfig(self.preview_rects[r][c], fill="#000000")
+
+            if p_type == TYPE_TEXT:
+                try:
+                    text_content = data.decode('utf-8')
+                    self.data_text_box.insert("end", f"Text Message:\n{text_content}")
+                except Exception as e:
+                    self.data_text_box.insert("end", f"Decoded binary text error: {e}")
+            elif p_type == TYPE_IMAGE:
+                self.data_text_box.insert("end", "Reconstructed 16x16 Pixel Image:\n")
+                flat_nibbles = []
+                for b in data:
+                    flat_nibbles.append((b >> 4) & 0x0F)
+                    flat_nibbles.append(b & 0x0F)
+                for idx, color_idx in enumerate(flat_nibbles[:256]):
+                    r = idx // 16
+                    c = idx % 16
+                    if 0 <= color_idx < len(PALETTE):
+                        self.preview_canvas.itemconfig(self.preview_rects[r][c], fill=PALETTE[color_idx])
+            elif p_type == TYPE_FILE:
+                os.makedirs("router_stored", exist_ok=True)
+                filename = datetime.now().strftime("forward_%Y%m%d_%H%M%S.bin")
+                filepath = os.path.join("router_stored", filename)
+                with open(filepath, "wb") as f:
+                    f.write(data)
+                self.data_text_box.insert("end", f"Stored Binary File ({len(data)} bytes)\nSaved locally to:\n{filepath}")
+        self.after(0, _render)
+
+    def toggle_router(self):
+        self.is_running = not self.is_running
+        if self.is_running:
             try:
-                print(f"Text Message:\n{data.decode('utf-8')}")
-            except Exception as e:
-                print(f"Decoded binary text error: {e}")
-        elif p_type == TYPE_IMAGE:
-            print("Reconstructed 16x16 Pixel Image:")
-            img = Image.new("RGB", (16, 16))
-            flat_nibbles = []
-            for b in data:
-                flat_nibbles.append((b >> 4) & 0x0F)
-                flat_nibbles.append(b & 0x0F)
-            for idx, color_idx in enumerate(flat_nibbles[:256]):
-                r = idx // 16
-                c = idx % 16
-                img.putpixel((c, r), hex_to_rgb(PALETTE[color_idx]))
-            display(img.resize((200, 200), Image.Resampling.NEAREST))
-        elif p_type == TYPE_FILE:
-            os.makedirs("router_stored", exist_ok=True)
-            filename = datetime.now().strftime("forward_%Y%m%d_%H%M%S.bin")
-            filepath = os.path.join("router_stored", filename)
-            with open(filepath, "wb") as f:
-                f.write(data)
-            print(f"Stored Binary File ({len(data)} bytes) saved locally to: {filepath}")
+                r_addr = int(self.router_id_entry.get())
+            except ValueError:
+                messagebox.showerror("Error", "Router ID must be an integer.")
+                self.is_running = False
+                return
 
-def on_toggle_clicked(b):
-    global router_thread
-    if toggle_btn.description.startswith('🚀'):
-        r_addr = router_id_input.value
-        router_thread = JupyterRouterThread(router_addr=r_addr, log_callback=log_msg, data_callback=display_received_data)
-        router_thread.start()
-        toggle_btn.description = '⏹️ Stop Router'
-        toggle_btn.button_style = 'danger'
-        status_label.value = f'<b>Status:</b> Listening on ID {r_addr}'
-    else:
-        if router_thread:
-            router_thread.stop()
-        toggle_btn.description = '🚀 Start Router'
-        toggle_btn.button_style = 'success'
-        status_label.value = '<b>Status:</b> Offline'
-        log_msg("Router stopped.")
+            self.toggle_btn.config(text="⏹️ Stop Router", bg="#f38ba8", fg="#11111b")
+            self.status_lbl.config(text=f"Status: Listening on ID {r_addr}", fg="#a6e3a1")
+            
+            self.router_thread = TkinterRouterThread(
+                router_addr=r_addr,
+                log_callback=self.log_msg,
+                data_callback=self.display_received_data
+            )
+            self.router_thread.start()
+        else:
+            if self.router_thread:
+                self.router_thread.stop()
+            self.toggle_btn.config(text="🚀 Start Router", bg="#a6e3a1", fg="#11111b")
+            self.status_lbl.config(text="Status: Offline", fg="#f38ba8")
+            self.log_msg("Router stopped.\n")
 
-toggle_btn.on_click(on_toggle_clicked)
-
-dashboard = widgets.VBox([
-    widgets.HBox([router_id_input, toggle_btn, status_label]),
-    widgets.Label("Live Router Event Log:"),
-    log_output,
-    widgets.Label("Stored Data / Reassembled Payload Preview:"),
-    data_output
-])
-
-display(dashboard)
+if __name__ == "__main__":
+    app = RouterApp()
+    app.mainloop()
