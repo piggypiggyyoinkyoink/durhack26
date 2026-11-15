@@ -121,7 +121,7 @@ def decode_nibbles_to_bytes(nibbles):
     return bytes([int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8)])
 
 # ============================================================================
-# ROUTER THREAD WITH LIVE CHUNK RENDERING
+# ROUTER THREAD WITH VERBOSE DIAGNOSTIC LOGGING
 # ============================================================================
 class TkinterRouterThread(threading.Thread):
     def __init__(self, router_addr, log_callback, data_callback, pixel_callback=None):
@@ -286,6 +286,7 @@ class TkinterRouterThread(threading.Thread):
         
         target_ready = self._listen_for_specific_response(TYPE_FORWARD_RESP, timeout=5.0, stream=stream, ring_buffer=ring_buffer)
         if not target_ready:
+            self.log_callback(f"[ROUTER TIMEOUT] Target {target_addr} did not respond to paging request.\n")
             return False
             
         self.log_callback(f"[ROUTER] Target {target_addr} ready! Forwarding data stream...\n")
@@ -300,15 +301,18 @@ class TkinterRouterThread(threading.Thread):
             
             ack_status, resp_seq = self._listen_for_ack_nak_internal(timeout=4.5, stream=stream, ring_buffer=ring_buffer)
             if ack_status == "ACK" and resp_seq == seq_num:
+                self.log_callback(f"[FORWARD ACK] Target acknowledged forward packet {seq_num + 1}/{total_packets}.\n")
                 seq_num += 1
                 retries = 0
             elif ack_status == "NAK":
+                self.log_callback(f"[FORWARD NAK] Target requested retransmission of sequence {resp_seq + 1}.\n")
                 seq_num = resp_seq if (resp_seq is not None and 0 <= resp_seq < total_packets) else seq_num
                 retries += 1
                 if retries >= 3:
                     return False
             else:
                 retries += 1
+                self.log_callback(f"[FORWARD TIMEOUT] No ACK/NAK from target on packet {seq_num + 1} (Attempt {retries}/3).\n")
                 if retries >= 3:
                     return False
 
@@ -387,8 +391,15 @@ class TkinterRouterThread(threading.Thread):
                                 raw_bytes = decode_nibbles_to_bytes(nibbles)
                                 full_payload = raw_bytes[2:-4]
                                 received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
+                                calculated_crc = zlib.crc32(full_payload) & 0xFFFFFFFF
                                 
-                                if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
+                                # --- DIAGNOSTIC CRC CHECK LOGGING ---
+                                if received_crc != calculated_crc:
+                                    self.log_callback(f"[CRC ERROR] Checksum mismatch! Received: {hex(received_crc)}, Calculated: {hex(calculated_crc)}. Packet dropped.\n")
+                                    state = "SEARCH_SYNC"
+                                    continue
+
+                                if len(full_payload) >= 1:
                                     p_type = full_payload[0]
                                     
                                     if p_type == TYPE_HS_REQ and len(full_payload) >= 5:
@@ -410,6 +421,7 @@ class TkinterRouterThread(threading.Thread):
                                         chunk_data = full_payload[5:]
                                         
                                         if seq_num == 0 and expected_seq != 0:
+                                            self.log_callback(f"[RESET] New transfer stream started at sequence 0. Clearing old reassembly buffer.\n")
                                             reassembly_buffer.clear()
                                             expected_seq = 0
                                             active_transfer_type = p_type_data
@@ -419,7 +431,7 @@ class TkinterRouterThread(threading.Thread):
 
                                         if seq_num == expected_seq:
                                             reassembly_buffer[seq_num] = chunk_data
-                                            self.log_callback(f"[UPLOAD RX] Packet {seq_num + 1}/{total_pkts} received from Sender {self.active_sender}. Sending ACK.\n")
+                                            self.log_callback(f"[UPLOAD RX] Valid Packet {seq_num + 1}/{total_pkts} (Type: {p_type_data}) received from Sender {self.active_sender}. Sending ACK.\n")
                                             
                                             # --- LIVE PREVIEW FEED UPDATE ---
                                             if active_transfer_type == TYPE_IMAGE and self.pixel_callback:
@@ -435,7 +447,7 @@ class TkinterRouterThread(threading.Thread):
 
                                             if expected_seq == total_pkts:
                                                 complete_data = b"".join(reassembly_buffer[i] for i in range(total_pkts))
-                                                self.log_callback(f"[UPLOAD COMPLETE] All packets gathered from {self.active_sender}. Initiating Target Paging...\n")
+                                                self.log_callback(f"[UPLOAD COMPLETE] All {total_pkts} packets gathered from {self.active_sender}. Initiating Target Paging...\n")
                                                 self.data_callback(active_transfer_type, complete_data, self.active_sender, self.active_target)
                                                 
                                                 success = self._page_and_forward_to_target(
@@ -449,8 +461,10 @@ class TkinterRouterThread(threading.Thread):
                                                 expected_seq = 0
                                                 active_transfer_type = None
                                         elif seq_num < expected_seq:
+                                            self.log_callback(f"[WARN] Duplicate Packet {seq_num + 1} received (Already expected {expected_seq + 1}). Resending ACK.\n")
                                             self._send_response(stream, ring_buffer, struct.pack('>H', seq_num), TYPE_ACK)
                                         else:
+                                            self.log_callback(f"[WARN] Sequence Gap! Received Packet {seq_num + 1}, but expected {expected_seq + 1}. Sending NAK.\n")
                                             self._send_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
                                 
                                 state = "SEARCH_SYNC"
