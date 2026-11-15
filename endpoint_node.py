@@ -19,8 +19,7 @@ TONE_DURATION = 0.080    # 80 ms tone + 20 ms guard silence
 SYMBOL_SAMPLES = int(SAMPLE_RATE * SYMBOL_DURATION)
 WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)
 STEP_SAMPLES = int(SAMPLE_RATE * 0.010)
-
-CHUNK_SIZE = 32  # Bytes per packet chunk
+CHUNK_SIZE = 32
 
 # Payload Type Identifiers
 TYPE_TEXT = 0x01
@@ -28,12 +27,14 @@ TYPE_IMAGE = 0x02
 TYPE_FILE = 0x03
 TYPE_ACK = 0x04
 TYPE_NAK = 0x05
-TYPE_HS_REQ = 0x10      # Handshake Request (Router Addr + Sender Addr)
-TYPE_HS_RESP = 0x11     # Handshake Response (Echo)
-TYPE_TARGET_REQ = 0x12  # Target Designation (Router Addr + Target Addr)
-TYPE_TARGET_RESP = 0x13 # Target Acknowledgement
+TYPE_HS_REQ = 0x10
+TYPE_HS_RESP = 0x11
+TYPE_TARGET_REQ = 0x12
+TYPE_TARGET_RESP = 0x13
+TYPE_FORWARD_REQ = 0x20
+TYPE_FORWARD_RESP = 0x21
+TYPE_FORWARD_FAIL = 0x22
 
-# 16 Data Frequencies: 8000 Hz to 11750 Hz (250 Hz spacing)
 DATA_FREQS = np.array([8000 + i * 250 for i in range(16)])
 SYNC_FREQ_A = 12250
 SYNC_FREQ_B = 12750
@@ -56,8 +57,6 @@ def hex_to_rgb(hex_str):
     hex_str = hex_str.lstrip('#')
     return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
 
-PALETTE_RGB = [hex_to_rgb(c) for c in PALETTE]
-
 # ============================================================================
 # ENCODER & ACOUSTIC FUNCTIONS
 # ============================================================================
@@ -77,18 +76,13 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     return wave
 
 def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
-    if payload_type in (TYPE_ACK, TYPE_NAK, TYPE_HS_RESP, TYPE_TARGET_RESP):
+    if payload_type in (TYPE_ACK, TYPE_NAK, TYPE_HS_RESP, TYPE_TARGET_RESP, TYPE_FORWARD_RESP, TYPE_FORWARD_FAIL):
         full_payload = bytes([payload_type]) + data_payload
     else:
         header = struct.pack('>BHH', payload_type, seq_num, total_packets)
         full_payload = header + data_payload
-
-    if len(full_payload) > 65535:
-        raise ValueError("Payload too large for 2-byte length header.")
-    
     crc = zlib.crc32(full_payload) & 0xFFFFFFFF
-    packet = struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
-    return packet
+    return struct.pack('>H', len(full_payload)) + full_payload + struct.pack('>I', crc)
 
 def play_audio_waveform(data_payload, payload_type, seq_num=0, total_packets=1):
     packet = build_packet(data_payload, payload_type, seq_num, total_packets)
@@ -97,11 +91,8 @@ def play_audio_waveform(data_payload, payload_type, seq_num=0, total_packets=1):
     waves = []
     for freq in [SYNC_FREQ_A, SYNC_FREQ_B] * 3:
         waves.append(generate_tone(freq, TONE_DURATION, SYMBOL_DURATION))
-        
     for i in range(0, len(bitstring), 4):
-        nibble_val = int(bitstring[i:i+4], 2)
-        waves.append(generate_tone(DATA_FREQS[nibble_val], TONE_DURATION, SYMBOL_DURATION))
-
+        waves.append(generate_tone(DATA_FREQS[int(bitstring[i:i+4], 2)], TONE_DURATION, SYMBOL_DURATION))
     waves.append(generate_tone(SYNC_FREQ_A, TONE_DURATION, SYMBOL_DURATION))
     waves.append(np.zeros(int(SAMPLE_RATE * 0.150), dtype=np.float32))
     
@@ -203,11 +194,6 @@ def perform_router_handshake(router_addr, my_addr, target_addr, callback_status)
         callback_status("Handshake FAILED: No confirmation from Router.", "#f38ba8")
         return False
         
-    r_echo, s_echo = struct.unpack('>HH', resp_data[:4])
-    if r_echo != router_addr or s_echo != my_addr:
-        callback_status("Handshake FAILED: Address mismatch in router echo!", "#f38ba8")
-        return False
-        
     callback_status("Handshake verified! Designating target...", "#f9e2af")
     play_audio_waveform(struct.pack('>HH', router_addr, target_addr), TYPE_TARGET_REQ)
     
@@ -216,7 +202,7 @@ def perform_router_handshake(router_addr, my_addr, target_addr, callback_status)
         callback_status("Target Designation FAILED: Router did not acknowledge target.", "#f38ba8")
         return False
         
-    callback_status("Router ready! Transferring data...", "#a6e3a1")
+    callback_status("Router ready! Uploading data...", "#a6e3a1")
     return True
 
 def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3):
@@ -227,7 +213,7 @@ def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3
 
     while seq_num < total_packets:
         pkt_label = f"Packet {seq_num + 1}/{total_packets}"
-        callback_status(f"Transmitting {pkt_label}...", "#89b4fa")
+        callback_status(f"Uploading {pkt_label}...", "#89b4fa")
         
         try:
             play_audio_waveform(chunks[seq_num], payload_type, seq_num=seq_num, total_packets=total_packets)
@@ -254,7 +240,15 @@ def transmit_with_arq(data_payload, payload_type, callback_status, max_retries=3
                 callback_status(f"FAILED: Timeout on {pkt_label}", "#f38ba8")
                 return False
 
-    callback_status(f"Transmission SUCCESS! All {total_packets} packet(s) acknowledged.", "#a6e3a1")
+    callback_status(f"Upload SUCCESS! Waiting for router target delivery confirmation...", "#a6e3a1")
+    
+    # Wait for delivery response (either SUCCESS or FAIL from router paging target)
+    success_deliv, deliv_data = listen_for_response(TYPE_FORWARD_FAIL, timeout=8.0)
+    if success_deliv:
+        callback_status("DELIVERY FAILED: Target was unreachable.", "#f38ba8")
+        return False
+        
+    callback_status("Delivery CONFIRMED by Router!", "#a6e3a1")
     return True
 
 def listen_for_ack_nak_local(timeout=4.0):
@@ -330,22 +324,22 @@ def listen_for_ack_nak_local(timeout=4.0):
         pass
     return None, None
 
-
 # ============================================================================
-# CONTINUOUS BACKGROUND RECEIVER THREAD FOR ENDPOINTS
+# ENDPOINT RECEIVER THREAD (HANDLES PAGING RESPONSES & INCOMING FORWARDED DATA)
 # ============================================================================
 class EndpointReceiverThread(threading.Thread):
-    def __init__(self, callback_packet_received, callback_pixel_received, callback_log):
+    def __init__(self, my_addr, callback_packet_received, callback_pixel_received, callback_log):
         super().__init__()
         self.daemon = True
+        self.my_addr = my_addr
         self.callback_packet_received = callback_packet_received
         self.callback_pixel_received = callback_pixel_received
         self.callback_log = callback_log
         self.running = False
 
-    def _send_control_response(self, stream, ring_buffer, seq_num, control_type):
+    def _send_control_response(self, stream, ring_buffer, payload, control_type):
         time.sleep(0.3)
-        play_audio_waveform(struct.pack('>H', seq_num), control_type)
+        play_audio_waveform(payload, control_type)
         time.sleep(0.15)
         while stream.read_available > 0:
             stream.read(min(stream.read_available, STEP_SAMPLES))
@@ -353,7 +347,7 @@ class EndpointReceiverThread(threading.Thread):
 
     def run(self):
         self.running = True
-        self.callback_log("[INFO] Endpoint listener active and waiting for incoming data...\n")
+        self.callback_log(f"[INFO] Endpoint listener active on ID {self.my_addr}...\n")
         
         ring_buffer = np.zeros(SYMBOL_SAMPLES * 7, dtype=np.float32)
         state = "SEARCH_SYNC"
@@ -423,12 +417,15 @@ class EndpointReceiverThread(threading.Thread):
                                 payload_len = struct.unpack('>H', decode_nibbles_to_bytes(nibbles[:4]))[0]
                                 expected_nibbles = (2 + payload_len + 4) * 2
 
-                            elif current_nibble_count == 14:
-                                header_bytes = decode_nibbles_to_bytes(nibbles[4:14])
-                                payload_type, seq_num, total_pkts = struct.unpack('>BHH', header_bytes)
-                                current_seq_num = seq_num if seq_num < total_pkts else expected_seq
-                                if payload_type == TYPE_IMAGE or active_transfer_type == TYPE_IMAGE:
-                                    is_image_packet = True
+                            elif current_nibble_count == 14 and expected_nibbles is not None:
+                                try:
+                                    header_bytes = decode_nibbles_to_bytes(nibbles[4:14])
+                                    payload_type, seq_num, total_pkts = struct.unpack('>BHH', header_bytes)
+                                    current_seq_num = seq_num if seq_num < total_pkts else expected_seq
+                                    if payload_type == TYPE_IMAGE or active_transfer_type == TYPE_IMAGE:
+                                        is_image_packet = True
+                                except Exception:
+                                    pass
 
                             elif (expected_nibbles is not None and 14 < current_nibble_count <= expected_nibbles - 8 and is_image_packet):
                                 nibble_in_chunk = current_nibble_count - 15
@@ -441,33 +438,44 @@ class EndpointReceiverThread(threading.Thread):
                                 full_payload = raw_bytes[2:-4]
                                 received_crc = struct.unpack('>I', raw_bytes[-4:])[0]
                                 
-                                if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 5:
-                                    p_type, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
-                                    chunk_data = full_payload[5:]
+                                if received_crc == (zlib.crc32(full_payload) & 0xFFFFFFFF) and len(full_payload) >= 1:
+                                    p_type = full_payload[0]
                                     
-                                    if seq_num == 0 and expected_seq != 0:
-                                        reassembly_buffer.clear()
-                                        expected_seq = 0
-                                        active_transfer_type = p_type
-
-                                    if active_transfer_type is None:
-                                        active_transfer_type = p_type
-
-                                    if seq_num == expected_seq:
-                                        reassembly_buffer[seq_num] = chunk_data
-                                        self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
-                                        expected_seq += 1
-
-                                        if expected_seq == total_pkts:
-                                            complete_data = b"".join(reassembly_buffer[i] for i in range(total_pkts))
-                                            self.callback_packet_received(bytes([active_transfer_type]) + complete_data)
+                                    # Check for Router Paging Request (`TYPE_FORWARD_REQ`)
+                                    if p_type == TYPE_FORWARD_REQ and len(full_payload) >= 5:
+                                        target_addr, sender_addr = struct.unpack('>HH', full_payload[1:5])
+                                        if target_addr == self.my_addr:
+                                            self.callback_log(f"[PAGED] Router paged us for incoming transfer from {sender_addr}. Replying READY...\n")
+                                            self._send_control_response(stream, ring_buffer, b"", TYPE_FORWARD_RESP)
+                                    
+                                    # Forwarded Data Packets
+                                    elif p_type in (TYPE_TEXT, TYPE_IMAGE, TYPE_FILE) and len(full_payload) >= 5:
+                                        p_type_data, seq_num, total_pkts = struct.unpack('>BHH', full_payload[:5])
+                                        chunk_data = full_payload[5:]
+                                        
+                                        if seq_num == 0 and expected_seq != 0:
                                             reassembly_buffer.clear()
                                             expected_seq = 0
-                                            active_transfer_type = None
-                                    elif seq_num < expected_seq:
-                                        self._send_control_response(stream, ring_buffer, seq_num, TYPE_ACK)
-                                    else:
-                                        self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
+                                            active_transfer_type = p_type_data
+
+                                        if active_transfer_type is None:
+                                            active_transfer_type = p_type_data
+
+                                        if seq_num == expected_seq:
+                                            reassembly_buffer[seq_num] = chunk_data
+                                            self._send_control_response(stream, ring_buffer, struct.pack('>H', seq_num), TYPE_ACK)
+                                            expected_seq += 1
+
+                                            if expected_seq == total_pkts:
+                                                complete_data = b"".join(reassembly_buffer[i] for i in range(total_pkts))
+                                                self.callback_packet_received(bytes([active_transfer_type]) + complete_data)
+                                                reassembly_buffer.clear()
+                                                expected_seq = 0
+                                                active_transfer_type = None
+                                        elif seq_num < expected_seq:
+                                            self._send_control_response(stream, ring_buffer, struct.pack('>H', seq_num), TYPE_ACK)
+                                        else:
+                                            self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
                                 else:
                                     self._send_control_response(stream, ring_buffer, struct.pack('>H', expected_seq), TYPE_NAK)
                                     
@@ -481,9 +489,8 @@ class EndpointReceiverThread(threading.Thread):
     def stop(self):
         self.running = False
 
-
 # ============================================================================
-# END POINT GUI APPLICATION WITH SEND & RECEIVE TABS
+# ENDPOINT GUI APPLICATION
 # ============================================================================
 class EndpointApp(tk.Tk):
     def __init__(self):
@@ -549,7 +556,7 @@ class EndpointApp(tk.Tk):
         tk.Label(self.tab_send_text, text="Enter UTF-8 Text Payload:", font=("Helvetica", 12, "bold"), bg="#181825", fg="#cdd6f4").pack(anchor="w", padx=20, pady=(20, 5))
         self.text_input = tk.Text(self.tab_send_text, height=10, font=("Courier", 12), bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4")
         self.text_input.pack(fill="x", padx=20, pady=10)
-        self.text_input.insert("1.0", "Hello through the central acoustic router!")
+        self.text_input.insert("1.0", "Hello through the central store-and-forward acoustic router!")
 
     def _build_file_tab(self):
         self.selected_file_path = None
@@ -659,8 +666,16 @@ class EndpointApp(tk.Tk):
     def toggle_listening(self):
         self.is_listening = not self.is_listening
         if self.is_listening:
+            try:
+                my_addr = int(self.my_addr_entry.get())
+            except ValueError:
+                messagebox.showerror("Error", "My Addr must be an integer.")
+                self.is_listening = False
+                return
+
             self.listen_btn.config(text="⏹️ STOP LISTENING", bg="#f38ba8")
             self.receiver_thread = EndpointReceiverThread(
+                my_addr=my_addr,
                 callback_packet_received=self.on_packet_received,
                 callback_pixel_received=self.update_rx_pixel_safely,
                 callback_log=self.append_log
