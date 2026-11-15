@@ -76,7 +76,9 @@ def generate_tone(freq, duration, total_slot_duration, sample_rate=SAMPLE_RATE, 
     return wave
 
 def build_packet(data_payload, payload_type, seq_num=0, total_packets=1):
-    if payload_type in (TYPE_ACK, TYPE_NAK, TYPE_HS_RESP, TYPE_TARGET_RESP, TYPE_FORWARD_RESP, TYPE_FORWARD_FAIL):
+    # Include TYPE_HS_REQ and TYPE_TARGET_REQ here so they bypass the sequence header
+    if payload_type in (TYPE_ACK, TYPE_NAK, TYPE_HS_RESP, TYPE_TARGET_RESP, 
+                        TYPE_FORWARD_RESP, TYPE_FORWARD_FAIL, TYPE_HS_REQ, TYPE_TARGET_REQ):
         full_payload = bytes([payload_type]) + data_payload
     else:
         header = struct.pack('>BHH', payload_type, seq_num, total_packets)
